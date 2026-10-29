@@ -26,15 +26,19 @@ ROTATION_SIZE = 13
 def minutes_table(ds: Dataset, team: str) -> pd.DataFrame:
     """Season, recent, and projected minutes for everyone on a team's roster with stats.
 
-    "Recent" counts the team's last 5 games this season with DNPs as zero, so players who are
-    hurt or out of the rotation fall out of the projection on their own.
+    "Proj Min" is minutes when he plays: the team's last 5 games he played in, blended with his
+    season average. "Play %" is the chance he gets into the game at all, from how many of the
+    team's recent games he played. The sim uses both: each night some players DNP, and the
+    ones who play get their normal minutes. (Spreading every player's expected minutes over the
+    whole 13-man list instead gave a few minutes a night to players who don't play and left the
+    regulars 2-4 minutes short, which dragged every counting stat down.)
     """
     p = ds.players[(ds.players["TEAM_ABBREVIATION"] == team) & (ds.players["GP"] > 0)]
     season_start = pd.Timestamp(int(ds.season[:4]), 10, 1)
     tlogs = ds.logs[(ds.logs["TEAM_ABBREVIATION"] == team) & (ds.logs["GAME_DATE"] >= season_start)]
-    recent_games = list(tlogs.drop_duplicates("GAME_ID")["GAME_ID"].head(5))
-    k = len(recent_games)
-    w_recent = k / (k + 4)
+    team_games = list(tlogs.drop_duplicates("GAME_ID")["GAME_ID"])
+    recent_games = team_games[:5]
+    play_games = team_games[:PLAY_WINDOW]
     rows = []
     for pid, r in p.iterrows():
         lg = ds.logs[(ds.logs["PLAYER_ID"] == pid) & (ds.logs["MIN"] > 0)]
@@ -42,26 +46,49 @@ def minutes_table(ds: Dataset, team: str) -> pd.DataFrame:
         l5 = lg["MIN"].head(5).mean() if len(lg) else np.nan
         l10 = lg["MIN"].head(10).mean() if len(lg) else np.nan
         sd = lg["MIN"].head(15).std() if len(lg) >= 4 else 6.0
-        if k:
-            played = tlogs[tlogs["PLAYER_ID"] == pid].set_index("GAME_ID")["MIN"]
-            recent = float(np.mean([played.get(g, 0.0) for g in recent_games]))
+        played = tlogs[(tlogs["PLAYER_ID"] == pid) & (tlogs["MIN"] > 0)].set_index("GAME_ID")["MIN"]
+        rec = [played[g] for g in recent_games if g in played.index]
+        if rec:
+            recent = float(np.mean(rec))
+            w_recent = len(rec) / (len(rec) + 4)
             proj = w_recent * recent + (1 - w_recent) * season_mpg
         else:
             recent = np.nan
             proj = season_mpg if np.isnan(l5) else 0.5 * l5 + 0.5 * season_mpg
+        n_played = int(played.index.isin(play_games).sum())
         rows.append({
             "PLAYER_ID": pid, "Player": r["PLAYER_NAME"], "GP": int(round(r["GP"])),
             "Season MPG": round(season_mpg, 1),
             "Team L5 MPG": round(recent, 1) if not np.isnan(recent) else None,
             "L10 MPG": round(l10, 1) if not np.isnan(l10) else None,
             "Min SD": round(float(np.clip(sd if not np.isnan(sd) else 5.0, 2.5, 6.5)), 1),
-            "Proj Min": round(proj, 1), "OUT": False,
+            "Proj Min": round(proj, 1),
+            "Play %": float(play_probability(np.array([proj]), np.array([n_played]), len(play_games))[0]),
+            "OUT": False,
         })
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df = df.sort_values("Proj Min", ascending=False).head(ROTATION_SIZE).reset_index(drop=True)
+    exp_min = df["Proj Min"] * df["Play %"]
+    df = df.loc[exp_min.sort_values(ascending=False).index].head(ROTATION_SIZE).reset_index(drop=True)
     return df
+
+
+PLAY_WINDOW = 10          # team games used to estimate how often a player gets in
+PLAY_PRIOR_GAMES = 1.0    # weight of the minutes-based prior, in games
+
+
+def play_probability(proj: np.ndarray, played: np.ndarray, k: int) -> np.ndarray:
+    """Chance each player gets into tonight's game.
+
+    Prior from his minutes when he plays (fit to this season's out-of-sample games: ~12 minutes
+    plays about half the time, 30+ almost always; injuries included), then updated with how many
+    of the team's last `k` games he actually played. The record dominates quickly: a player who
+    sat the last few games plays only ~20% of the time next game, one who played them all ~90%+.
+    """
+    prior = np.clip(0.3 + 0.02 * proj, 0.3, 0.95)
+    p = (played + PLAY_PRIOR_GAMES * prior) / (k + PLAY_PRIOR_GAMES)
+    return np.round(np.clip(p, 0.05, 1.0), 2)
 
 
 def normalize_minutes(mins: np.ndarray, total: float = 240.0, cap: float = MAX_MIN) -> np.ndarray:
@@ -78,6 +105,44 @@ def normalize_minutes(mins: np.ndarray, total: float = 240.0, cap: float = MAX_M
         if (m <= cap + 1e-9).all():
             break
         m = np.minimum(m, cap)
+    return m
+
+
+def normalize_minutes_rows(m: np.ndarray, total: float = 240.0, cap: float = MAX_MIN) -> np.ndarray:
+    """normalize_minutes for each row of an (n,P) array."""
+    m = np.clip(np.asarray(m, dtype=float), 0, None).copy()
+    for _ in range(20):
+        free = m < cap - 1e-9
+        fixed = total - np.where(free, 0, m).sum(1, keepdims=True)
+        fs = np.where(free, m, 0).sum(1, keepdims=True)
+        m = np.where(free, m * fixed / np.maximum(fs, 1e-12), m)
+        if (m <= cap + 1e-9).all():
+            break
+        m = np.minimum(m, cap)
+    return m
+
+
+def sample_minutes(rng, proj: np.ndarray, sd: np.ndarray, p_play: np.ndarray, n: int,
+                   iters: int = 6) -> np.ndarray:
+    """(n,P) minutes per simulated game that sum to 240.
+
+    Each player gets in with probability p_play, then plays about proj / p_play +/- sd.
+    Clipping at zero and fitting every game to 240 drags the regulars below their projection
+    (bench players' clipped draws only push up), so the centers are solved so that each player's
+    average minutes come back out at proj.
+    """
+    proj = np.asarray(proj, float)
+    p = np.clip(np.asarray(p_play, float), 1e-3, 1.0)
+    plays = rng.random((n, len(proj))) < p[None, :]
+    plays[:, np.argsort(-proj)[:5]] = True       # always a full five on the floor
+    plays[:, proj < 0.5] = False
+    z = rng.normal(0, 1, (n, len(proj))) * sd[None, :]
+    c = proj / p
+    m = None
+    for _ in range(iters):
+        m = normalize_minutes_rows(np.where(plays, np.clip(c[None, :] + z, 1.0, 46), 0))
+        got = m.mean(0)
+        c = np.clip(c * np.where(got > 1e-6, proj / np.maximum(got, 1e-6), 1.0), 0, 46)
     return m
 
 
@@ -137,6 +202,7 @@ class TeamProfile:
     anchor: np.ndarray = None       # (P,) bool: staggered top-usage starter
     base_share: np.ndarray = None   # (P,) normal share of plays while on the floor
     base_tc: np.ndarray = None      # (P,) normal teammate passing quality around him
+    p_play: np.ndarray = None       # (P,) chance he gets into the game
 
 
 def _group(pos: str) -> str:
@@ -286,6 +352,14 @@ def team_profile(ds: Dataset, abbr: str, minutes: pd.DataFrame, use_wowy: bool =
     trips = np.clip(pl["FTA"].values - and1_fta, 0, None) / 2.0 / mins[:, 0]
     ft_pct = (pl["FTM"].values + FT_SHRINK * lg["FT_PCT"]) / (pl["FTA"].values + FT_SHRINK)
 
+    # Proj Min is minutes when he plays; the rotation is fit on expected minutes (x Play %).
+    # The top five always play (someone has to start), so they keep Play % = 1.
+    p_play = (m["Play %"].fillna(1.0).values.astype(float).clip(0.05, 1.0) if "Play %" in m
+              else np.ones(len(m)))
+    p_play[np.argsort(-(m["Proj Min"].values * p_play))[:5]] = 1.0
+    m["Proj Min"] = m["Proj Min"].values * p_play
+    if "Play %" in out:
+        out = out.assign(**{"Proj Min": out["Proj Min"] * out["Play %"].fillna(1.0)})
     proj = redistribute_minutes(m, out, positions)
     pos_list = [positions[p] for p in m["PLAYER_ID"]]
     starter, deep, big, guard, anchor = roles(proj, pos_list, _play_rate(pl))
@@ -321,7 +395,8 @@ def team_profile(ds: Dataset, abbr: str, minutes: pd.DataFrame, use_wowy: bool =
         blk=pl["BLK"].values / mins[:, 0], team=team, positions=pos_list, big=big,
         guard=guard, starter=starter, deep=deep, usage_mult=lw["usage_mult"], wowy=lw["wowy"],
         lineup_context=lw["context"], anchor=anchor, base_share=lw["base_share"],
-        base_tc=lw["base_tc"], ast_target=lw["ast_target"])
+        base_tc=lw["base_tc"], ast_target=lw["ast_target"],
+        p_play=p_play)
     prof.team_id = t.name if not isinstance(t.name, str) else ds.teams.index[ds.teams["TEAM_ABBREVIATION"] == abbr][0]
     if tr is not None:
         from types import SimpleNamespace
