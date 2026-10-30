@@ -151,7 +151,8 @@ with tab_rot:
                 "this season (DNPs count as 0) with the season average. Edit minutes or tick "
                 "**OUT** for injuries: the absent player's minutes go mostly to teammates at his "
                 "position, and his shots go to whoever shares the floor in his place. "
-                "Minutes are fit to 240 by trimming the end of the bench first.")
+                "Minutes are fit to 240 by trimming the end of the bench first. **Play %** is how often "
+                "he gets in at all; props only count simulated games he plays, like a book voiding a DNP.")
     edited = {}
     cols = st.columns(2)
     for col, team in zip(cols, (away, home)):
@@ -160,11 +161,14 @@ with tab_rot:
             base = get_minutes(ds, team, ds.built_at)
             edited[team] = st.data_editor(
                 base, key=f"rot_{team}", hide_index=True, width="stretch",
-                column_order=["Player", "OUT", "Proj Min", "Min SD", "Season MPG", "Team L5 MPG",
-                              "L10 MPG", "GP"],
+                column_order=["Player", "OUT", "Proj Min", "Play %", "Min SD", "Season MPG",
+                              "Team L5 MPG", "L10 MPG", "GP"],
                 disabled=["Player", "Season MPG", "Team L5 MPG", "L10 MPG", "GP"],
                 column_config={
                     "Proj Min": st.column_config.NumberColumn(min_value=0.0, max_value=48.0, step=0.5),
+                    "Play %": st.column_config.NumberColumn(
+                        help="Chance he plays at all (recent DNPs). Minutes when he plays = Proj Min / Play %.",
+                        min_value=0.05, max_value=1.0, step=0.05, format="%.2f"),
                     "Min SD": st.column_config.NumberColumn(help="Game-to-game minutes SD", step=0.5),
                     "GP": st.column_config.NumberColumn(help="Blended games (prior season down-weighted)"),
                 })
@@ -344,7 +348,9 @@ def player_lookup():
     out = {}
     for team, prof, opp in ((away, away_prof, home), (home, home_prof, away)):
         for i, (pid, nm) in enumerate(zip(prof.ids, prof.names)):
-            out[nm] = dict(team=team, idx=i, pid=pid, opp=opp, proj=prof.proj_min[i], sd=prof.min_sd[i])
+            # Minutes when he plays (props are void on a DNP).
+            proj = prof.proj_min[i] / (prof.p_play[i] if prof.p_play is not None else 1.0)
+            out[nm] = dict(team=team, idx=i, pid=pid, opp=opp, proj=proj, sd=prof.min_sd[i])
     return out
 
 
@@ -450,7 +456,8 @@ with tab_props:
         oo_ = -110 if pd.isna(oo_) else oo_
         uo_ = -110 if pd.isna(uo_) else uo_
         ev = evaluate_prop(ds, vals, info["pid"], row["Stat"], float(row["Line"]), oo_, uo_,
-                           proj_min=info["proj"], min_sd=info["sd"], opp_abbr=info["opp"])
+                           proj_min=info["proj"], min_sd=info["sd"], opp_abbr=info["opp"],
+                           sim_min=res.players[info["team"]]["MIN"][:, info["idx"]])
         results.append({"Player": row["Player"], "Team": info["team"], "Stat": row["Stat"],
                         "Book": row.get("Book") or "Manual", "Over odds": oo_, "Under odds": uo_,
                         "Proj Min": info["proj"], **ev})
@@ -675,7 +682,8 @@ with tab_player:
     oo = a.number_input("Over odds", value=-110, step=5, key="dd_oo")
     uo = a.number_input("Under odds", value=-110, step=5, key="dd_uo")
     vals = sum(res.players[info["team"]][p][:, info["idx"]] for p in PROP_STATS[stat])
-    ev = evaluate_prop(ds, vals, pid, stat, line, oo, uo, info["proj"], info["sd"], info["opp"])
+    ev = evaluate_prop(ds, vals, pid, stat, line, oo, uo, info["proj"], info["sd"], info["opp"],
+                       sim_min=res.players[info["team"]]["MIN"][:, info["idx"]])
     with a:
         st.metric("Value Score", f"{ev['Value Score']:.0f} ({ev['Grade']})", ev["Pick"])
         st.write(f"Sim P(over): **{pct(ev['Sim P(over)'])}** · book (no-vig) {pct(ev['Book P(over)'])}")

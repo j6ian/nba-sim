@@ -36,9 +36,16 @@ season refreshes every 6 hours, or click **Refresh data from NBA.com**.
 
 - **Data**: current season blended with last season. Last season is worth at most N games
   (default 20), so early-season samples don't swing everything.
-- **Minutes**: the team's last 5 games this season (DNP counts as 0) blended with the season
-  average, then fit to 240 by trimming the end of the bench first. An OUT player's minutes go
-  mostly to teammates in his position group (G / F / C).
+- **Minutes**: **Proj Min** is minutes when he plays (the team's last 5 games he played,
+  blended with the season average). **Play %** is the chance he gets in at all, from how many
+  of the team's last 10 games he played. Each simulated game some players DNP and the rest get
+  their normal minutes; expected minutes (Proj Min x Play %) are fit to 240 by trimming the end
+  of the bench first. An OUT player's minutes go mostly to teammates in his position group
+  (G / F / C). Blowout rest in the 4th is balanced by heavier starter minutes in close games, so
+  a player's average stays at his projection.
+- **Prop odds**: only simulated games the player plays count (books void a DNP), and the sim's
+  P(over) is shrunk toward 50/50 (`PROB_SHRINK` in props.py) because raw sim probabilities
+  backtested as overconfident. Check with `python scripts/backtest_props.py --projected`.
 - **Lineups**: every simulated game has a minute-by-minute rotation. Role templates have
   starters opening halves and closing games, the bench covering the middle, and the top-usage
   starter staggered to play with the bench. The templates are fit so exactly five are on the

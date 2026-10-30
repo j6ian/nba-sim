@@ -34,7 +34,7 @@ import numpy as np
 from .data import ZONES
 from .lineups import (OT_SEGS, REG_SEGS, SEG_PER_Q, blowout_q4_template, fit_probabilities,
                       game_probabilities, role_templates, sample_lineups)
-from .model import (ZONE_LEN, OffenseVsDefense, TeamProfile, expected_pace, normalize_minutes,
+from .model import (ZONE_LEN, OffenseVsDefense, TeamProfile, expected_pace, sample_minutes,
                     offense_vs_defense)
 
 STATS = ["MIN", "PTS", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "OREB", "DREB", "AST",
@@ -102,10 +102,8 @@ class _Team:
         self.usage_form = np.exp(rng.normal(0, USAGE_FORM_SD, (n, P)))
         self.pass_form = np.exp(rng.normal(0, USAGE_FORM_SD, (n, P)))
         # Sampled minutes per game, renormalized to 240.
-        raw = rng.normal(self.prof.proj_min, self.prof.min_sd, (n, P))
-        raw = np.clip(raw, 0, 46)
-        raw[:, self.prof.proj_min < 0.5] = 0
-        self.game_min = np.apply_along_axis(normalize_minutes, 1, raw)
+        p_play = self.prof.p_play if self.prof.p_play is not None else np.ones(P)
+        self.game_min = sample_minutes(rng, self.prof.proj_min, self.prof.min_sd, p_play, n)
         mult = self.prof.usage_mult if self.prof.usage_mult is not None else np.ones(P)
         self.play_w = mvd.outcome_rate.sum(1) * mult
         self.on = np.zeros((n, REG_SEGS + 6 * OT_SEGS, P), bool)
@@ -115,6 +113,7 @@ class _Team:
     def plan_q4(self, rng, margin: np.ndarray):
         """Re-plan the 4th quarter from minutes still owed; starters sit in blowouts."""
         owed = np.clip(self.game_min - self.on[:, :36].sum(1), 0, None)
+        base_owed = owed.copy()
         a = np.abs(margin)
         keep = np.where(a >= 22, 0.25, np.where(a >= 16, 0.5, np.where(a >= 12, 0.8, 1.0)))
         st = self.prof.starter
@@ -122,6 +121,15 @@ class _Team:
         owed[:, st] *= keep[:, None]
         bw = owed[:, ~st] + 1.0  # +1 so deep bench gets garbage time too
         owed[:, ~st] += bw / bw.sum(1, keepdims=True) * freed[:, None]
+        # Projected minutes are season averages that already include real blowouts, so garbage
+        # time must not lower anyone's average: the minutes starters lose in blowouts come back
+        # in competitive games (coaches ride them when it's close), and the bench gives them back.
+        blow = keep < 1
+        if blow.any() and (~blow).any():
+            close_sum = owed[~blow].sum(0)
+            f = (base_owed.sum(0) - owed[blow].sum(0)) / np.maximum(close_sum, 1e-9)
+            owed[~blow] *= np.clip(f, 0.5, 2.0)[None, :]
+            owed = np.minimum(owed, 12.0)
         normal = role_templates(self.P, st, self.prof.deep, self.prof.anchor)[36:]
         tmpl = np.where((keep < 1)[:, None, None], blowout_q4_template(st)[None], normal[None])
         pi = fit_probabilities(tmpl, owed)
