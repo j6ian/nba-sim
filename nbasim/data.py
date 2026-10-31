@@ -167,6 +167,8 @@ def fetch_roster(season: str) -> pd.DataFrame:
 # Cache files that were too old to use but had to be, because NBA.com couldn't be reached:
 # {name: saved-at datetime}. Shown in the app and the slate report.
 STALE: dict = {}
+RETRY_AFTER_MIN = 180  # after NBA.com fails, use saved data without retrying for this long
+                       # ("Refresh data from NBA.com" in the app always tries)
 
 
 def _cached(name: str, max_age_hours: float | None, fn):
@@ -177,16 +179,26 @@ def _cached(name: str, max_age_hours: float | None, fn):
         if max_age_hours is None or age_h < max_age_hours:
             with open(path, "rb") as fh:
                 return pickle.load(fh)
+    # After a failed download, don't retry for a while: each attempt waits out several retries,
+    # which made every app load take minutes while NBA.com was blocking this network.
+    down = os.path.join(CACHE_DIR, ".nba_unreachable")
+    recently_down = os.path.exists(down) and (time.time() - os.path.getmtime(down)) / 60 < RETRY_AFTER_MIN
     try:
+        if recently_down and os.path.exists(path) and max_age_hours != 0:
+            raise RuntimeError("NBA.com was unreachable a few minutes ago")
         value = fn()
     except Exception:
         # NBA.com unreachable (it blocks some networks): fall back to the last saved copy.
         if not os.path.exists(path):
             raise
+        if not recently_down:
+            open(down, "w").close()
         STALE[name] = dt.datetime.fromtimestamp(os.path.getmtime(path))
         with open(path, "rb") as fh:
             return pickle.load(fh)
     STALE.pop(name, None)
+    if os.path.exists(down):
+        os.remove(down)
     with open(path, "wb") as fh:
         pickle.dump(value, fh)
     return value

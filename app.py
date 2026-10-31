@@ -27,7 +27,8 @@ from nbasim.tracking import PLAY_TYPES, PT_LABELS, load_tracking
 from nbasim.props import PROP_STATS, default_line, evaluate_prop, log_values, prob_to_american
 from nbasim.lineups import on_off_usage, top_lineups
 from nbasim.sim import simulate
-from nbasim.wowy import teammate_table
+from nbasim.wowy import player_split_games, split_summary, teammate_table
+from nbasim import hitrates
 
 st.set_page_config(page_title="NBA Matchup Simulator", page_icon="🏀", layout="wide")
 
@@ -354,9 +355,10 @@ if home == away:
 T = ds.teams.set_index("TEAM_ABBREVIATION")
 st.title(f"{names[away]} @ {names[home]}")
 
-tab_sim, tab_props, tab_player, tab_match, tab_rot, tab_watch, tab_model = st.tabs(
-    ["🎲 Game Sim", "💰 Player Props", "🔍 Player Deep Dive", "📊 Matchup", "⏱ Rotations",
-     "📺 Watch a Game", "🧠 Model & Data"])
+(tab_sim, tab_props, tab_player, tab_hits, tab_wowy, tab_match, tab_rot, tab_watch,
+ tab_model) = st.tabs(
+    ["🎲 Game Sim", "💰 Player Props", "🔍 Player Deep Dive", "🎯 Hit Rates", "🔀 With / Without",
+     "📊 Matchup", "⏱ Rotations", "📺 Watch a Game", "🧠 Model & Data"])
 
 sched = {}
 for team in (away, home):
@@ -979,6 +981,170 @@ with tab_player:
     st.caption(f"Orange = projected {info['proj']:.1f} min. Simulated minutes: mean {sim_min.mean():.1f}, "
                f"10th–90th pct {np.percentile(sim_min, 10):.0f}–{np.percentile(sim_min, 90):.0f} "
                f"(includes blowout rest and OT).")
+
+# --------------------------------------------------------------------------- hit rates tab
+
+def team_players(team: str, opp: str, min_mpg: float) -> list[dict]:
+    """Players currently on `team` averaging min_mpg+ minutes, with tonight's injury status."""
+    pl = ds.players[(ds.players["TEAM_ABBREVIATION"] == team) & (ds.players["GP"] > 0)]
+    mpg = pl["MIN"] / pl["GP"].clip(lower=1)
+    pl = pl[mpg >= min_mpg]
+    inj = team_injuries(team)
+    mp = oddsapi.match_players(inj["Player"], list(pl["PLAYER_NAME"])) if len(inj) else {}
+    status = {mp[r["Player"]]: r["Status"] for _, r in inj.iterrows() if r["Player"] in mp}
+    return [{"pid": pid, "name": r["PLAYER_NAME"], "team": team, "opp": opp,
+             "status": status.get(r["PLAYER_NAME"], "")} for pid, r in pl.iterrows()]
+
+
+def tonight_lines(games: list[tuple]) -> pd.DataFrame:
+    """Sportsbook lines already pulled for these games (no new credits), with names matched to
+    the stats' player names."""
+    frames = []
+    for a, h in games:
+        raw = None
+        live = st.session_state.get(f"live_{a}_{h}_{game_date}")
+        sp = st.session_state.slate_props.get(slate_key(a, h))
+        if live is not None:
+            raw = live["lines"].assign(Player=live["lines"]["Book player"])
+        elif sp is not None:
+            raw = sp["raw"].copy()
+        if raw is None or raw.empty:
+            continue
+        pl = ds.players[ds.players["TEAM_ABBREVIATION"].isin([a, h])]
+        mp = oddsapi.match_players(raw["Player"], list(pl["PLAYER_NAME"]))
+        frames.append(raw.assign(Player=raw["Player"].map(mp)))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+with tab_hits:
+    st.markdown("How often each player cleared a line in his recent games, grouped into **100%**, "
+                "**90%+** and **80%+** hit rates. Use tonight's sportsbook lines (once fetched) or "
+                "round alt lines (10+, 15+, 20+ points...).")
+    h1, h2, h3, h4 = st.columns(4)
+    hr_scope = h1.radio("Players", ["This game", "All games on the slate"], key="hr_scope",
+                        disabled=not slate, help="The slate needs the day's games at the top of the page.")
+    hr_n = h2.slider("Games back", 3, 82, 10, key="hr_n",
+                     help="His last N games (this season first, then last season). With an "
+                          "opponent picked, the last N games against that team.")
+    opp_opts = ["Any team", "Tonight's opponent"] + abbrs
+    hr_opp = h3.selectbox("Against", opp_opts, key="hr_opp", format_func=lambda o: o if o in opp_opts[:2] else fmt(o))
+    hr_venue = h4.radio("Venue", ["All", "Home", "Away"], horizontal=True, key="hr_venue")
+    h5, h6, h7, h8 = st.columns(4)
+    hr_stats = h5.multiselect("Stats", list(hitrates.LADDERS), default=["PTS", "REB", "AST", "3PM", "PRA"],
+                              key="hr_stats")
+    hr_min_games = h6.number_input("Minimum games", 1, 82, min(5, hr_n), key="hr_min_g",
+                                   help="Players with fewer games in the sample are left out "
+                                        "(a 2-for-2 isn't a 100% hit rate worth trusting).")
+    hr_min_mpg = h7.number_input("Minimum minutes a game", 0.0, 40.0, 15.0, 1.0, key="hr_min_mpg")
+    hr_out = h8.toggle("Hide players OUT tonight", True, key="hr_hide_out")
+
+    games_in = ([(g["away"], g["home"]) for g in slate] if hr_scope == "All games on the slate" and slate
+                else [(away, home)])
+    players = []
+    for a, h in games_in:
+        players += team_players(a, h, hr_min_mpg) + team_players(h, a, hr_min_mpg)
+    if hr_out:
+        players = [p for p in players if p["status"] != "Out"]
+    opp_mode = None if hr_opp == "Any team" else "tonight" if hr_opp == "Tonight's opponent" else hr_opp
+    book = tonight_lines(games_in)
+    modes = (["Sportsbook lines"] if not book.empty else []) + ["Alt-line ladder"]
+    hr_mode = st.radio("Lines", modes, horizontal=True, key="hr_mode",
+                       help="Sportsbook lines appear once lines are fetched for these games "
+                            "(Player Props tab or 'Pull props for all games'). No credits are used here.")
+    if book.empty:
+        st.caption("No sportsbook lines fetched for these games yet, so showing the alt-line ladder.")
+    if hr_mode == "Sportsbook lines":
+        book = book[book["Stat"].isin(hr_stats)]
+        hits = hitrates.book_line_hits(ds, players, book, hr_n, opp_mode, hr_venue, hr_min_games)
+    else:
+        hits = hitrates.ladder_hits(ds, players, hr_stats, hr_n, opp_mode, hr_venue, hr_min_games)
+
+    if hits.empty:
+        st.info("Nothing at 80% or better with these filters. Try more stats, fewer games back, or "
+                "a lower minimum games.")
+    else:
+        status = {p["name"]: p["status"] for p in players}
+        hits["Status"] = hits["Player"].map(status).replace("", "—")
+        cols = ["Player", "Team", "Opp", "Status", "Stat", "Side", "Line", "Hits", "Hit %", "Avg", "Low",
+                "Best odds", "Book", "Recent"]
+        fmt_map = {"Hit %": "{:.0%}", "Avg": "{:.1f}", "Low": "{:g}", "Best odds": "{:+.0f}"}
+        for _, label in hitrates.TIERS:
+            t = hits[hits["Tier"] == label].sort_values(["Games", "Avg"], ascending=False)
+            st.subheader(f"{label} hit rate ({len(t)})")
+            if t.empty:
+                st.caption("None.")
+                continue
+            st.dataframe(t[[c for c in cols if c in t]].style.format(fmt_map, na_rep="—"),
+                         hide_index=True, width="stretch", height=min(42 + 35 * len(t), 460))
+        opp_note = {"Any team": "any opponent", "Tonight's opponent": "tonight's opponent"}.get(hr_opp, hr_opp)
+        st.caption(f"Last {hr_n} games vs {opp_note}"
+                   + (f", {hr_venue.lower()} games only" if hr_venue != "All" else "")
+                   + ". **Recent** lists his values newest first. Alt lines show the highest round "
+                     "line he cleared at each rate; a line in a higher tier isn't repeated below. "
+                     "Hit rates ignore matchup and minutes changes: check the Player Props tab's "
+                     "Value Score and tonight's injuries too.")
+
+# --------------------------------------------------------------------------- with / without tab
+
+with tab_wowy:
+    st.markdown("A player's averages in games when teammates sat out, compared with games they all "
+                "played. Covers this season and last season (games after a trade only count once he "
+                "joined the team).")
+    w1, w2 = st.columns(2)
+    ww_team = w1.selectbox("Team", [away, home] + [t for t in abbrs if t not in (away, home)],
+                           format_func=fmt, key="ww_team")
+    roster = ds.players[(ds.players["TEAM_ABBREVIATION"] == ww_team) & (ds.players["GP"] > 0)]
+    roster = roster.assign(MPG=roster["MIN"] / roster["GP"].clip(lower=1)).sort_values("MPG", ascending=False)
+    ww_player = w2.selectbox("Player", list(roster.index), key=f"ww_player_{ww_team}",
+                             format_func=lambda pid: roster.loc[pid, "PLAYER_NAME"])
+    mates = [pid for pid in roster.index if pid != ww_player]
+    w3, w4, w5 = st.columns([2, 2, 1])
+    ww_out = w3.multiselect("Teammates OUT", mates, key=f"ww_out_{ww_team}",
+                            format_func=lambda pid: roster.loc[pid, "PLAYER_NAME"],
+                            help="Games where all of these players sat out.")
+    ww_in = w4.multiselect("Teammates playing (optional)", [m for m in mates if m not in ww_out],
+                           key=f"ww_in_{ww_team}", format_func=lambda pid: roster.loc[pid, "PLAYER_NAME"],
+                           help="Only count games where these players did play.")
+    ww_n = w5.number_input("Games back (each split)", 1, 164, 82, key="ww_n")
+    pname = roster.loc[ww_player, "PLAYER_NAME"]
+    if not ww_out:
+        st.info(f"Pick one or more teammates who were OUT to see {pname}'s averages without them.")
+    else:
+        wo_g, w_g = player_split_games(ds, ww_team, ww_player, ww_out, ww_in)
+        wo_g, w_g = wo_g.head(int(ww_n)), w_g.head(int(ww_n))
+        out_names = ", ".join(roster.loc[j, "PLAYER_NAME"] for j in ww_out)
+        s_wo, s_w = split_summary(wo_g), split_summary(w_g)
+        if s_wo["GP"] == 0:
+            st.warning(f"No games where {pname} played and {out_names} sat out (in the stats loaded: "
+                       f"{ds.prior_season} and {ds.season}).")
+        else:
+            cols = ["GP", "MIN", "PTS", "REB", "AST", "FG3M", "PRA", "FGA", "FG3A", "FTA", "STL", "BLK", "TOV"]
+            tbl = pd.DataFrame([{"Split": f"Without {out_names}", **s_wo},
+                                {"Split": "With them" if len(ww_out) > 1 else f"With {out_names}", **s_w}])
+            if s_w["GP"]:
+                tbl.loc[2] = {"Split": "Difference", **{c: s_wo[c] - s_w[c] for c in cols if c != "GP"}, "GP": np.nan}
+            st.dataframe(numeric(tbl[["Split"] + cols], skip=("Split",)).rename(columns={"FG3M": "3PM", "FG3A": "3PA"})
+                         .style.format({c: "{:.1f}" for c in ["MIN", "PTS", "REB", "AST", "3PM", "PRA", "FGA",
+                                                              "3PA", "FTA", "STL", "BLK", "TOV"]} | {"GP": lambda v: "—" if pd.isna(v) else f"{v:.0f}"},
+                                       na_rep="—"),
+                         hide_index=True, width="stretch")
+            if s_wo["GP"] < 5:
+                st.caption(f"⚠️ Only {s_wo['GP']} game(s) without them: treat these averages as a rough guide.")
+            st.markdown("**Hit rate in games without them**")
+            c1, c2 = st.columns([1, 3])
+            ww_stat = c1.selectbox("Stat", list(hitrates.LADDERS), key="ww_stat")
+            vals = hitrates.stat_values(wo_g, ww_stat)
+            ww_line = c1.number_input("Line", 0.0, 100.0, float(np.floor(vals.mean()) + 0.5), 0.5, key=f"ww_line_{ww_player}_{ww_stat}_{len(ww_out)}")
+            over = int((vals > ww_line).sum())
+            c2.metric(f"Over {ww_line:g} {ww_stat}", f"{over}/{len(vals)} ({over / len(vals):.0%})",
+                      help=f"Average {vals.mean():.1f} without them")
+            log = wo_g.assign(Date=wo_g["GAME_DATE"].dt.strftime("%b %-d, %Y"),
+                              PRA=wo_g["PTS"] + wo_g["REB"] + wo_g["AST"])
+            st.markdown(f"**Games without {out_names}**")
+            st.dataframe(log[["Date", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST", "FG3M", "PRA", "FGA", "FTA"]]
+                         .rename(columns={"MATCHUP": "Game", "FG3M": "3PM"})
+                         .style.format({"MIN": "{:.0f}"}), hide_index=True, width="stretch",
+                         height=min(42 + 35 * len(log), 420))
 
 # --------------------------------------------------------------------------- matchup tab
 

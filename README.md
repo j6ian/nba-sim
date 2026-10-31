@@ -30,6 +30,15 @@ event list instead.
   opponent allows, last-20 game log against the line, simulated distribution, and minutes trend.
   **Lineup context** shows his simulated usage with vs without each teammate on the floor, next
   to his real per-36 production in games each teammate played vs missed.
+- **Hit Rates**: how often each player cleared a line, grouped into 100%, 90%+ and 80%+ tiers.
+  Uses tonight's sportsbook lines once fetched (both sides, with the best price), or an alt-line
+  ladder (10+, 15+, 20+ points...) showing the highest line he cleared at each rate. Filters:
+  games back, opponent (any team, tonight's opponent, or a specific team), home/away, stats,
+  minimum games and minutes, and this game or the whole slate.
+- **With / Without**: a player's per-game averages in games when chosen teammates sat out
+  (e.g. Murray without Jokić) vs games they all played, the difference, a hit-rate check at any
+  line, and the list of those games. Covers this season and last season; before a trade, only
+  games after he joined count.
 - **Matchup**: pace, offensive / defensive / net ratings, four factors, and per-game stats allowed,
   with ranks. Also zone defense.
 - **Rotations**: projected minutes for every player. Edit minutes or mark injured players OUT;

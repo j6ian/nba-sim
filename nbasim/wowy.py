@@ -27,11 +27,14 @@ def _usage(df: pd.DataFrame) -> float:
     return (df["FGA"].sum() + 0.44 * df["FTA"].sum() + df["TOV"].sum()) / mins if mins > 0 else np.nan
 
 
-def split(ds: Dataset, team: str, i, j) -> dict | None:
-    """Player i's per-minute production with vs without teammate j, on `team`."""
+def game_sets(ds: Dataset, team: str, j) -> tuple[set, set]:
+    """Team games teammate j played in, and team games he missed while on the roster.
+
+    This season every team game counts (he's on the roster now); in earlier seasons only games
+    between his first and last appearance for the team, so games before a trade don't count."""
     tl = ds.logs[ds.logs["TEAM_ABBREVIATION"] == team]
     if tl.empty:
-        return None
+        return set(), set()
     tl = tl.assign(SEASON=_season_key(tl["GAME_DATE"]))
     cur = int(ds.season[:4])
     jg = tl[(tl["PLAYER_ID"] == j) & (tl["MIN"] > 0)]
@@ -39,13 +42,21 @@ def split(ds: Dataset, team: str, i, j) -> dict | None:
     for season, sg in tl.groupby("SEASON"):
         js = jg[jg["SEASON"] == season]
         if season == cur:
-            # j is on the roster now, so every team game this season counts.
             window = sg
         elif len(js):
             window = sg[(sg["GAME_DATE"] >= js["GAME_DATE"].min()) & (sg["GAME_DATE"] <= js["GAME_DATE"].max())]
         else:
             continue
         without_ids |= set(window["GAME_ID"]) - with_ids
+    return with_ids, without_ids
+
+
+def split(ds: Dataset, team: str, i, j) -> dict | None:
+    """Player i's per-minute production with vs without teammate j, on `team`."""
+    tl = ds.logs[ds.logs["TEAM_ABBREVIATION"] == team]
+    if tl.empty:
+        return None
+    with_ids, without_ids = game_sets(ds, team, j)
     ig = tl[(tl["PLAYER_ID"] == i) & (tl["MIN"] > 0)]
     w = ig[ig["GAME_ID"].isin(with_ids)]
     wo = ig[ig["GAME_ID"].isin(without_ids)]
@@ -98,3 +109,35 @@ def observed_usage_ratio(ds: Dataset, team: str, i, out_ids: list) -> tuple[floa
         ratio *= 1 + w * (raw - 1)
         evidence += s["GP without"]
     return ratio, evidence
+
+
+SPLIT_STATS = ["MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "FGA", "FG3A", "FTA"]
+
+
+def player_split_games(ds: Dataset, team: str, pid, out_ids: list, in_ids: list = ()) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Player's game logs for `team` split into (games where every `out_ids` teammate sat and every
+    `in_ids` teammate played, games where all of them played). Most recent first."""
+    tl = ds.logs[(ds.logs["TEAM_ABBREVIATION"] == team) & (ds.logs["PLAYER_ID"] == pid) & (ds.logs["MIN"] > 0)]
+    tl = tl.sort_values("GAME_DATE", ascending=False)
+    without, together = set(tl["GAME_ID"]), set(tl["GAME_ID"])
+    for j in out_ids:
+        w, wo = game_sets(ds, team, j)
+        without &= wo
+        together &= w
+    for j in in_ids:
+        w, _ = game_sets(ds, team, j)
+        without &= w
+        together &= w
+    return tl[tl["GAME_ID"].isin(without)], tl[tl["GAME_ID"].isin(together)]
+
+
+def split_summary(games: pd.DataFrame) -> dict:
+    """Per-game averages for a set of games."""
+    if games.empty:
+        return {"GP": 0}
+    out = {"GP": len(games)}
+    for c in SPLIT_STATS:
+        out[c] = float(games[c].mean())
+    out["PRA"] = float((games["PTS"] + games["REB"] + games["AST"]).mean())
+    out["Usage/min"] = _usage(games)
+    return out
