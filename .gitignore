@@ -5,3 +5,4 @@ data/
 __pycache__/
 *.pkl
 .DS_Store
+reports/

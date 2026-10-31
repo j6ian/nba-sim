@@ -14,6 +14,12 @@ season refreshes every 6 hours, or click **Refresh data from NBA.com**.
 
 ## Tabs
 
+The top of the page lists the games on the sidebar's game date (today by default), with
+tip-off times, records, and live scores once games start. The first game opens by default;
+click **Open** on any game to simulate it in the tabs below. The schedule comes from NBA.com
+(cached on disk); if NBA.com can't be reached, upcoming games come from The Odds API's free
+event list instead.
+
 - **Game Sim**: win %, projected score, spread, and total from thousands of simulated games.
   Also pace (possessions), each team's shot volume (FGA / 3PA / FTA / TOV), points by quarter,
   shot zones, and projected box scores. Enter a market spread or total to get cover %.
@@ -43,6 +49,13 @@ season refreshes every 6 hours, or click **Refresh data from NBA.com**.
   of the bench first. An OUT player's minutes go mostly to teammates in his position group
   (G / F / C). Blowout rest in the 4th is balanced by heavier starter minutes in close games, so
   a player's average stays at his projection.
+- **Injuries**: ESPN's NBA injury report (refreshed every 20 minutes) is applied automatically.
+  Out players are ticked OUT. For day-to-day players, the latest news note is read for the game
+  date (questionable, doubtful, probable...), and their Play % is multiplied by 0.25 (doubtful),
+  0.55 (questionable), 0.75 (day-to-day, no detail) or 0.95 (probable). A note about a different
+  game ("ruled out for Thursday's game" on a Friday) counts as plain day-to-day. Statuses show in
+  the Rotations tab's **Injury** column and on the game cards (rotation players only). Override
+  any of it in Rotations, or turn it off with **Use injury report** in the sidebar.
 - **Prop odds**: only simulated games the player plays count (books void a DNP), and the sim's
   P(over) is shrunk toward 50/50 (`PROB_SHRINK` in props.py) because raw sim probabilities
   backtested as overconfident. Check with `python scripts/backtest_props.py --projected`.
@@ -89,6 +102,16 @@ Cost: finding the game is free. Props cost 1 credit per market per game for up t
 (4 markets = 4 credits, so about 120 games a month on the free plan). Responses are cached for
 10 minutes. Every line from every book is scored, and **Best line for each prop** picks the
 book and side with the highest Value Score.
+
+**Game lines, always on:** with a key set, spreads, totals and moneylines for every game load
+automatically in one request (3 credits, at most once every 10 minutes while the app is in use).
+Each game card shows the consensus (median across books), and the Game Sim tab's market
+comparison starts at it.
+
+**Props for all games at once:** pick prop types under **Player props to pull** at the top of the
+page (the cost updates as you pick: 1 credit per prop type per game), then click **💰 Pull props
+for all games**. Opening a game then loads its props with no extra credits. The same prop types
+are used by the Props tab's single-game **Fetch live lines**.
 
 ## Tracking, play-type and matchup data
 

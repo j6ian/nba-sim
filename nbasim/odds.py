@@ -33,6 +33,11 @@ MARKETS = {
     "TOV": "player_turnovers", "FTM": "player_frees_made",
 }
 MARKET_TO_STAT = {v: k for k, v in MARKETS.items()}
+MARKET_LABELS = {
+    "PTS": "Points", "REB": "Rebounds", "AST": "Assists", "3PM": "Threes made",
+    "PRA": "Pts+Reb+Ast", "PR": "Pts+Reb", "PA": "Pts+Ast", "RA": "Reb+Ast", "STL": "Steals",
+    "BLK": "Blocks", "STL+BLK": "Steals+Blocks", "TOV": "Turnovers", "FTM": "Free throws made",
+}
 DEFAULT_MARKETS = ["PTS", "REB", "AST", "3PM"]
 
 # Book key -> display name. Up to 10 books in one request are billed as a single region.
@@ -80,7 +85,44 @@ def _get(path: str, key: str, params: dict) -> tuple[object, dict]:
         raise OddsError(f"The Odds API couldn't fulfil the request (422): {r.text[:200]}")
     if not r.ok:
         raise OddsError(f"The Odds API returned {r.status_code}: {r.text[:200]}")
+    if quota.get("remaining") is not None:
+        _save_quota(quota)
     return r.json(), quota
+
+
+QUOTA_FILE = os.path.join(CACHE_DIR, "odds", "quota.json")
+
+
+def _save_quota(quota: dict):
+    """Remember the credit count. The API's quota headers sometimes lag (two calls a few seconds
+    apart can report 481 and 431 left), so within a month keep whichever reading has used more
+    credits; usage only goes up until the monthly reset."""
+    now = time.time()
+    try:
+        with open(QUOTA_FILE) as fh:
+            old = json.load(fh)
+        same_month = time.strftime("%Y-%m", time.localtime(old["at"])) == time.strftime("%Y-%m")
+        if same_month and int(old.get("used") or 0) > int(quota.get("used") or 0):
+            quota = {**quota, "used": old["used"], "remaining": old["remaining"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        os.makedirs(os.path.dirname(QUOTA_FILE), exist_ok=True)
+        with open(QUOTA_FILE, "w") as fh:
+            json.dump({**quota, "at": now}, fh)
+    except OSError:
+        pass
+
+
+def latest_quota() -> dict | None:
+    """Credits left as of the most recent request (any endpoint, including the free ones)."""
+    try:
+        with open(QUOTA_FILE) as fh:
+            q = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    q["checked"] = time.strftime("%H:%M", time.localtime(q["at"]))
+    return q
 
 
 def _nick(team_name: str) -> str:
@@ -107,8 +149,9 @@ def find_event(events: list, home_name: str, away_name: str, game_date=None) -> 
 
 
 def fetch_props(key: str, event_id: str, stats: list[str], books: list[str],
-                max_age_min: float = 10.0) -> tuple[dict, dict]:
-    """Prop odds for one game. Cached on disk for `max_age_min` minutes to save credits."""
+                max_age_min: float = 10.0, cache_only: bool = False) -> tuple[dict, dict]:
+    """Prop odds for one game. Cached on disk for `max_age_min` minutes to save credits.
+    cache_only: never spend credits; raise OddsError if these lines aren't saved."""
     markets = ",".join(MARKETS[s] for s in stats)
     tag = re.sub(r"[^a-z0-9]+", "_", f"{event_id}_{markets}_{','.join(sorted(books))}".lower())
     path = os.path.join(CACHE_DIR, "odds", f"{tag[:180]}.json")
@@ -117,12 +160,48 @@ def fetch_props(key: str, event_id: str, stats: list[str], books: list[str],
         with open(path) as fh:
             saved = json.load(fh)
         return saved["data"], {**saved["quota"], "cached": True}
+    if cache_only:
+        raise OddsError("no saved lines for these prop types and books")
     data, quota = _get(f"/sports/{SPORT}/events/{event_id}/odds", key, {
         "bookmakers": ",".join(books), "markets": markets, "oddsFormat": "american",
         "dateFormat": "iso"})
     with open(path, "w") as fh:
         json.dump({"data": data, "quota": quota, "fetched": time.time()}, fh)
     return data, {**quota, "cached": False}
+
+
+def fetch_game_lines(key: str, books: list[str], max_age_min: float = 10.0) -> tuple[list, dict]:
+    """Moneyline, spread and total for every upcoming game in one request (3 credits)."""
+    path = os.path.join(CACHE_DIR, "odds", f"game_lines_{'_'.join(sorted(books))}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 60 < max_age_min:
+        with open(path) as fh:
+            saved = json.load(fh)
+        return saved["data"], {**saved["quota"], "cached": True,
+                               "fetched": time.strftime("%H:%M", time.localtime(saved["fetched"]))}
+    data, quota = _get(f"/sports/{SPORT}/odds", key, {
+        "bookmakers": ",".join(books), "markets": "h2h,spreads,totals", "oddsFormat": "american",
+        "dateFormat": "iso"})
+    with open(path, "w") as fh:
+        json.dump({"data": data, "quota": quota, "fetched": time.time()}, fh)
+    return data, {**quota, "cached": False, "fetched": time.strftime("%H:%M")}
+
+
+def game_line_summary(event: dict) -> dict:
+    """Consensus (median across books) home spread, total and moneylines for one game."""
+    spreads, totals, ml_home, ml_away = [], [], [], []
+    for bk in event.get("bookmakers", []):
+        for mk in bk.get("markets", []):
+            for oc in mk.get("outcomes", []):
+                if mk["key"] == "spreads" and oc.get("name") == event["home_team"] and oc.get("point") is not None:
+                    spreads.append(float(oc["point"]))
+                elif mk["key"] == "totals" and str(oc.get("name")).lower() == "over" and oc.get("point") is not None:
+                    totals.append(float(oc["point"]))
+                elif mk["key"] == "h2h" and oc.get("price") is not None:
+                    (ml_home if oc.get("name") == event["home_team"] else ml_away).append(float(oc["price"]))
+    med = lambda v: float(pd.Series(v).median()) if v else None
+    return {"home_spread": med(spreads), "total": med(totals), "home_ml": med(ml_home),
+            "away_ml": med(ml_away), "books": len(event.get("bookmakers", []))}
 
 
 def props_frame(event_odds: dict) -> pd.DataFrame:

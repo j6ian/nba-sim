@@ -18,6 +18,8 @@ warnings.filterwarnings("ignore")
 
 from nbasim.data import ZONE_LABELS, ZONES, current_season, load_dataset
 from nbasim import odds as oddsapi
+from nbasim import schedule as slate_schedule
+from nbasim import injuries
 from nbasim.detail import schedule_context, schedule_factor
 from nbasim.factors import NOT_AVAILABLE, REGISTRY, Weights
 from nbasim.model import expected_pace, minutes_table, player_efficiency, set_tracking, team_profile
@@ -53,6 +55,16 @@ def get_tracking(_ds, built_at: str, prior_games: float, refresh_token: int):
 def get_profile(_ds, _tr, team: str, minutes: pd.DataFrame, built_at: str, w_pot: float, w_ch: float,
                 model_version: float = 0.0):
     return team_profile(_ds, team, minutes, tr=_tr, w_pot=w_pot, w_chances=w_ch)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_injuries():
+    return injuries.fetch_report()
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def get_slate(date: dt.date, team_names: tuple):
+    return slate_schedule.games_on(date, dict(team_names))
 
 
 def numeric(df: pd.DataFrame, skip=("Player", "Teammate", "Teammate out", "Lineup", "Usage split")) -> pd.DataFrame:
@@ -95,6 +107,11 @@ with st.sidebar.expander("Factor weights"):
                                format="%.3f" if mx <= 0.05 else "%.2f")
     weights = Weights(**wvals)
 def_strength, home_edge = weights.def_strength, weights.home_edge
+use_injuries = st.sidebar.toggle(
+    "Use injury report", True,
+    help="From ESPN's NBA injury report. Out players are ticked OUT; questionable, doubtful and "
+         "day-to-day players get a lower Play % (chance they play). Turn off to set everything "
+         "by hand in ⏱ Rotations.")
 n_sims = st.sidebar.select_slider("Simulations", [500, 1000, 2000, 3000, 5000, 10000], 3000)
 if "refresh" not in st.session_state:
     st.session_state.refresh = 0
@@ -122,11 +139,214 @@ teams_df = ds.teams.sort_values("TEAM_NAME")
 abbrs = list(teams_df["TEAM_ABBREVIATION"])
 names = dict(zip(teams_df["TEAM_ABBREVIATION"], teams_df["TEAM_NAME"]))
 fmt = lambda a: f"{names[a]} ({a})"
-away = st.sidebar.selectbox("Away team", abbrs, index=abbrs.index("DEN") if "DEN" in abbrs else 0,
-                            format_func=fmt)
-home = st.sidebar.selectbox("Home team", abbrs, index=abbrs.index("OKC") if "OKC" in abbrs else 1,
-                            format_func=fmt)
+
+# The day's games. The first one opens by default; clicking a game opens it below.
+slate, slate_source = get_slate(game_date, tuple(sorted(names.items())))
+if st.session_state.get("slate_date") != game_date:
+    st.session_state.slate_date = game_date
+    on_slate = {(g["away"], g["home"]) for g in slate}
+    if slate and (st.session_state.get("away_sel"), st.session_state.get("home_sel")) not in on_slate:
+        st.session_state.away_sel, st.session_state.home_sel = slate[0]["away"], slate[0]["home"]
+for k, d in (("away_sel", "DEN"), ("home_sel", "OKC")):
+    if st.session_state.get(k) not in abbrs:
+        st.session_state[k] = d if d in abbrs else abbrs[0 if k == "away_sel" else 1]
+
+
+def open_game(a: str, h: str):
+    st.session_state.away_sel, st.session_state.home_sel = a, h
+
+
+away = st.sidebar.selectbox("Away team", abbrs, key="away_sel", format_func=fmt)
+home = st.sidebar.selectbox("Home team", abbrs, key="home_sel", format_func=fmt)
 st.sidebar.caption(f"Data: {ds.season} blended with {ds.prior_season} · built {ds.built_at}")
+
+# Odds settings are shared by the Props tab and the slate's "Pull props for all games".
+for k, d in (("odds_key", oddsapi.api_key() or ""), ("odds_books", list(oddsapi.DEFAULT_BOOKS)),
+             ("odds_markets", list(oddsapi.DEFAULT_MARKETS)), ("slate_props", {})):
+    st.session_state.setdefault(k, d)
+
+
+def slate_key(a: str, h: str) -> str:
+    return f"{a}_{h}_{game_date}"
+
+
+def load_game_lines(games: list[dict]) -> tuple[dict, dict | None, str | None]:
+    """Spread, total and moneyline for every game, refreshed automatically (3 credits, at most
+    once every 10 minutes while the app is in use)."""
+    key, books = st.session_state.odds_key, st.session_state.odds_books
+    if not (key and books and games):
+        return {}, None, None
+    try:
+        events, q = oddsapi.fetch_game_lines(key, books)
+    except oddsapi.OddsError as exc:
+        return {}, None, str(exc)
+    out = {}
+    for g in games:
+        ev = oddsapi.find_event(events, names[g["home"]], names[g["away"]], game_date)
+        if ev is not None:
+            out[slate_key(g["away"], g["home"])] = oddsapi.game_line_summary(ev)
+    return out, q, None
+
+
+def fetch_slate_props(games: list[dict]):
+    """Player props for each game on the slate, for the prop types picked above."""
+    key, books, mkts = (st.session_state.odds_key, st.session_state.odds_books,
+                        st.session_state.odds_markets)
+    used, remaining, missing, errors = 0, None, [], []
+    bar = st.progress(0.0, text="Finding games...")
+    try:
+        events, _ = oddsapi.list_events(key)
+    except oddsapi.OddsError as exc:
+        st.session_state.slate_msg = ("error", str(exc))
+        bar.empty()
+        return
+    fetched = dt.datetime.now().strftime("%H:%M")
+    for i, g in enumerate(games):
+        a, h = g["away"], g["home"]
+        bar.progress((i + 1) / len(games), text=f"Fetching props: {a} @ {h} ({i + 1}/{len(games)})")
+        ev = oddsapi.find_event(events, names[h], names[a], game_date)
+        if ev is None:
+            missing.append(f"{a} @ {h}")
+            continue
+        try:
+            data, q = oddsapi.fetch_props(key, ev["id"], mkts, books)
+        except oddsapi.OddsError as exc:
+            errors.append(f"{a} @ {h}: {exc}")
+            if "429" in str(exc):
+                break
+            continue
+        used += 0 if q.get("cached") else int(q.get("last") or 0)
+        remaining = q.get("remaining") or remaining
+        raw = oddsapi.props_frame(data)
+        if raw.empty:
+            missing.append(f"{a} @ {h}")
+            continue
+        st.session_state.slate_props[slate_key(a, h)] = {"raw": raw, "quota": q, "event": ev,
+                                                         "fetched": fetched}
+        # Drop lines loaded earlier for this game so the Props tab picks up the new ones.
+        st.session_state.pop(f"live_{slate_key(a, h)}", None)
+        st.session_state.pop(f"props_{a}_{h}_live", None)
+    bar.empty()
+    n_ok = sum(slate_key(g["away"], g["home"]) in st.session_state.slate_props for g in games)
+    msg = (f"Loaded {', '.join(mkts)} props for {n_ok} of {len(games)} games at {fetched} · "
+           f"used {used} credits · credits left: {(oddsapi.latest_quota() or {}).get('remaining', remaining)}")
+    if missing:
+        msg += f". No props posted yet: {', '.join(missing)}"
+    if errors:
+        msg += ". Errors: " + "; ".join(errors)
+    st.session_state.slate_msg = ("error" if errors and not n_ok else "success", msg)
+
+
+inj_report, inj_error, inj_stamp = get_injuries() if use_injuries else (None, None, "")
+
+
+def team_injuries(team: str) -> pd.DataFrame:
+    """Tonight's injury designations for a team (empty when the report is off)."""
+    if inj_report is None or inj_report.empty:
+        return pd.DataFrame(columns=["Player", "Status", "note"])
+    return injuries.for_team(inj_report, names[team], game_date)
+
+
+def card_injuries(team: str, min_mpg: float = 15.0) -> str:
+    """'WAS: Johnson Q, Poole O' for rotation players (min_mpg+ this season) who are hurt."""
+    r = team_injuries(team)
+    r = r[r["Status"] != "Available"]
+    if r.empty:
+        return ""
+    pl = ds.players[ds.players["TEAM_ABBREVIATION"] == team]
+    mpg = dict(zip(pl["PLAYER_NAME"], pl["MIN"] / pl["GP"].clip(lower=1)))
+    mapping = oddsapi.match_players(r["Player"], list(mpg))
+    hurt = [(row["Player"], row["Status"]) for _, row in r.iterrows()
+            if mpg.get(mapping.get(row["Player"]), 0) >= min_mpg]
+    if not hurt:
+        return ""
+    return f"{team}: " + ", ".join(f"{p.split()[-1]} {injuries.SHORT.get(st_, st_)}" for p, st_ in hurt)
+
+
+def american(o) -> str:
+    return "—" if o is None else f"{int(round(o)):+d}"
+
+
+game_lines, gl_quota, gl_error = load_game_lines(slate)
+st.session_state.slate_lines = game_lines
+
+
+def show_credits():
+    if not st.session_state.odds_key or gl_error:
+        return
+    q = oddsapi.latest_quota()
+    left = f"credits left: {q['remaining']} (as of {q['checked']})" if q else ""
+    updated = f"last updated {gl_quota.get('fetched', '')} · " if gl_quota else ""
+    credits_box.caption("Spreads, totals and moneylines update automatically (3 credits, at most "
+                        f"once every 10 minutes) · {updated}{left}")
+
+
+day_label = "Today's games" if game_date == dt.date.today() else f"Games on {game_date:%a, %b %-d}"
+with st.expander(f"📅 {day_label} ({len(slate)})", expanded=True):
+    if not slate:
+        st.caption(f"No games found for this date ({slate_source}). Change the game date in the "
+                   "sidebar, or pick teams there.")
+    if not st.session_state.odds_key:
+        st.caption("Add your Odds API key in 💰 Player Props → Live sportsbook lines to get "
+                   "spreads, totals and player props.")
+    elif gl_error:
+        st.warning(f"Couldn't update spreads and totals: {gl_error}")
+    # Filled again at the end of the script, after any fetch on this run, so the credit count
+    # is always the latest.
+    credits_box = st.empty()
+    show_credits()
+
+    mkts = st.pills("Player props to pull", list(oddsapi.MARKETS), selection_mode="multi",
+                    key="odds_markets", format_func=lambda m: oddsapi.MARKET_LABELS.get(m, m),
+                    help="1 credit per prop type per game, for up to 10 books. Prop types a book "
+                         "hasn't posted yet aren't charged.") or []
+    if slate:
+        cost = len(mkts) * len(slate)
+        b1, b2 = st.columns([1, 3])
+        if b1.button(f"💰 Pull props for all {len(slate)} games", type="primary", width="stretch",
+                     disabled=not (st.session_state.odds_key and mkts and st.session_state.odds_books)):
+            fetch_slate_props(slate)
+        b2.caption(f"**Cost: up to {cost} credits** ({len(mkts)} prop type{'s' if len(mkts) != 1 else ''} "
+                   f"× {len(slate)} games). Pulling again within 10 minutes is free. Pick a game "
+                   "and use 💰 Player Props → Fetch live lines to pull just that game "
+                   f"({len(mkts)} credits). Books are set there too.")
+        if "slate_msg" in st.session_state:
+            kind, msg = st.session_state.slate_msg
+            (st.error if kind == "error" else st.success)(msg)
+    per_row = 5
+    for i in range(0, len(slate), per_row):
+        cols = st.columns(per_row)
+        for col, g in zip(cols, slate[i:i + per_row]):
+            a, h = g["away"], g["home"]
+            selected = (a, h) == (away, home)
+            with col.container(border=True):
+                if g["status"] >= 2 and g["away_score"] is not None:
+                    st.markdown(f"**{a}** {g['away_score']}  \n**{h}** {g['home_score']}")
+                else:
+                    ar = f" ({g['away_record']})" if g["away_record"] else ""
+                    hr = f" ({g['home_record']})" if g["home_record"] else ""
+                    st.markdown(f"**{a}**{ar}  \n@ **{h}**{hr}")
+                info = [slate_schedule.status_line(g)]
+                gl = game_lines.get(slate_key(a, h))
+                if gl and gl["home_spread"] is not None:
+                    info.append(f"{h} {gl['home_spread']:+g}" if gl["home_spread"] else "PK")
+                if gl and gl["total"] is not None:
+                    info.append(f"O/U {gl['total']:g}")
+                if gl and gl["home_ml"] is not None and gl["away_ml"] is not None:
+                    info.append(f"ML {a} {american(gl['away_ml'])} / {h} {american(gl['home_ml'])}")
+                sp = st.session_state.slate_props.get(slate_key(a, h))
+                if sp is not None:
+                    info.append(f"📡 {len(sp['raw'])} props")
+                st.caption(" · ".join(info))
+                inj = [x for x in (card_injuries(a), card_injuries(h)) if x]
+                if inj:
+                    st.caption("🚑 " + " · ".join(inj))
+                st.button("✓ Open" if selected else "Open", key=f"open_{g['game_id']}_{a}{h}",
+                          on_click=open_game, args=(a, h), width="stretch",
+                          type="primary" if selected else "secondary", disabled=selected)
+    if slate:
+        st.caption(f"Schedule from {slate_source}. Open a game to simulate it in the tabs below.")
+
 if home == away:
     st.warning("Pick two different teams.")
     st.stop()
@@ -159,12 +379,20 @@ with tab_rot:
         with col:
             st.subheader(names[team])
             base = get_minutes(ds, team, ds.built_at)
+            tinj = team_injuries(team)
+            base = injuries.apply(base, tinj)
+            # A new key when the report changes for this team, so new statuses show up
+            # (hand edits otherwise stay as they are).
+            inj_tag = hashlib.md5(str(sorted(zip(tinj["Player"], tinj["Status"]))).encode()).hexdigest()[:8]
             edited[team] = st.data_editor(
-                base, key=f"rot_{team}", hide_index=True, width="stretch",
-                column_order=["Player", "OUT", "Proj Min", "Play %", "Min SD", "Season MPG",
+                base, key=f"rot_{team}_{inj_tag}", hide_index=True, width="stretch",
+                column_order=["Player", "OUT", "Injury", "Proj Min", "Play %", "Min SD", "Season MPG",
                               "Team L5 MPG", "L10 MPG", "GP"],
-                disabled=["Player", "Season MPG", "Team L5 MPG", "L10 MPG", "GP"],
+                disabled=["Player", "Injury", "Season MPG", "Team L5 MPG", "L10 MPG", "GP"],
                 column_config={
+                    "Injury": st.column_config.TextColumn(
+                        width="medium", help="Tonight's status from ESPN's injury report and the "
+                                             "latest news note. Hover a cell to read it all."),
                     "Proj Min": st.column_config.NumberColumn(min_value=0.0, max_value=48.0, step=0.5),
                     "Play %": st.column_config.NumberColumn(
                         help="Chance he plays at all (recent DNPs). Minutes when he plays = Proj Min / Play %.",
@@ -172,6 +400,13 @@ with tab_rot:
                     "Min SD": st.column_config.NumberColumn(help="Game-to-game minutes SD", step=0.5),
                     "GP": st.column_config.NumberColumn(help="Blended games (prior season down-weighted)"),
                 })
+    if use_injuries:
+        mult = ", ".join(f"{k.lower()} x{v:g}" for k, v in injuries.PLAY_MULT.items() if v < 1)
+        st.caption(f"🚑 Injury report from ESPN (updated {inj_stamp or 'unknown'}). Out players are "
+                   f"ticked OUT. Others' Play % is multiplied by their status ({mult}); a news note "
+                   "about a different game counts as day-to-day. Untick OUT or edit Play % to "
+                   "override, or turn the report off in the sidebar."
+                   + (f" ⚠️ {inj_error}" if inj_error else ""))
 
 with st.spinner("Building rotations and lineup weights..."):
     _mv = max(os.path.getmtime(f) for f in __import__("glob").glob(
@@ -282,8 +517,14 @@ with tab_sim:
 
     st.subheader("Compare to the market")
     m1, m2, m3 = st.columns(3)
-    spread_line = m1.number_input(f"{home} spread", value=float(np.round(-margin.mean() * 2) / 2), step=0.5)
-    total_line = m2.number_input("Game total", value=float(np.round(total.mean() * 2) / 2), step=0.5)
+    # Pre-filled with the books' consensus when odds were fetched, else the sim's own numbers.
+    mkt = st.session_state.slate_lines.get(slate_key(away, home)) or {}
+    sp0 = mkt.get("home_spread") if mkt.get("home_spread") is not None else float(np.round(-margin.mean() * 2) / 2)
+    tot0 = mkt.get("total") if mkt.get("total") is not None else float(np.round(total.mean() * 2) / 2)
+    spread_line = m1.number_input(f"{home} spread" + (" (market)" if mkt.get("home_spread") is not None else ""),
+                                  value=float(sp0), step=0.5)
+    total_line = m2.number_input("Game total" + (" (market)" if mkt.get("total") is not None else ""),
+                                 value=float(tot0), step=0.5)
     cover = (margin + spread_line > 0).mean()
     over = (total > total_line).mean()
     m3.markdown(f"**{home} {spread_line:+.1f} covers:** {pct(cover)} (fair {prob_to_american(cover)})  \n"
@@ -356,6 +597,17 @@ def player_lookup():
 
 lookup = player_lookup()
 
+def attach_live(raw: pd.DataFrame, quota: dict, ev: dict, fetched: str):
+    """Match a book's player names to tonight's sim and make these the game's live lines."""
+    mapping = oddsapi.match_players(raw["Player"], list(lookup))
+    raw["Book player"] = raw["Player"]
+    raw["Player"] = raw["Player"].map(mapping)
+    st.session_state[live_key] = {
+        "lines": raw, "quota": quota, "event": ev,
+        "unmatched": sorted(set(raw.loc[raw["Player"].isna(), "Book player"])), "fetched": fetched}
+    st.session_state.pop(f"props_{away}_{home}_live", None)
+
+
 with tab_props:
     live_key = f"live_{away}_{home}_{game_date}"
     with st.expander("📡 Live sportsbook lines (FanDuel, DraftKings, Fanatics, ...)",
@@ -366,15 +618,17 @@ with tab_props:
             "terms. You need your own free API key (500 credits/month). Set it as the "
             "`ODDS_API_KEY` environment variable, or paste it here. It's kept only for this session.")
         k1, k2, k3 = st.columns([2, 2, 2])
-        api_key_in = k1.text_input("The Odds API key", value=oddsapi.api_key() or "", type="password")
+        api_key_in = k1.text_input("The Odds API key", type="password", key="odds_key")
         books_sel = k2.multiselect("Books (up to 10 cost the same as 1)", list(oddsapi.BOOKS),
-                                   default=oddsapi.DEFAULT_BOOKS, format_func=oddsapi.BOOKS.get,
-                                   max_selections=10)
-        mk_sel = k3.multiselect("Prop markets (1 credit each per game)", list(oddsapi.MARKETS),
-                                default=oddsapi.DEFAULT_MARKETS)
-        st.caption(f"This fetch costs about {len(mk_sel)} credits (less if some markets aren't "
-                   "posted yet). Responses are cached for 10 minutes, so reruns are free. "
-                   "Listing games is free.")
+                                   format_func=oddsapi.BOOKS.get, max_selections=10, key="odds_books")
+        mk_sel = st.session_state.odds_markets or []
+        k3.markdown("**Prop types**  \n" + (", ".join(oddsapi.MARKET_LABELS.get(m, m) for m in mk_sel)
+                                           or "None picked")
+                    + "  \n:small[Pick them under **Player props to pull** at the top of the page.]")
+        st.caption(f"Fetching this game costs up to {len(mk_sel)} credits (prop types not posted yet "
+                   "aren't charged). Responses are cached for 10 minutes, so reruns are free. "
+                   "Listing games is free. The key and books are also used by **Pull props for "
+                   "all games** at the top of the page.")
         if st.button("Fetch live lines", type="primary", disabled=not (api_key_in and mk_sel and books_sel)):
             try:
                 with st.spinner("Finding the game and fetching props..."):
@@ -385,24 +639,21 @@ with tab_props:
                             f"No upcoming {names[away]} @ {names[home]} game on The Odds API. Props "
                             "are usually posted the day before or the morning of the game.")
                     data, quota = oddsapi.fetch_props(api_key_in, ev["id"], mk_sel, books_sel)
-                    raw = oddsapi.props_frame(data)
-                    mapping = oddsapi.match_players(raw["Player"], list(lookup))
-                    raw["Book player"] = raw["Player"]
-                    raw["Player"] = raw["Player"].map(mapping)
-                    st.session_state[live_key] = {
-                        "lines": raw, "quota": quota, "event": ev,
-                        "unmatched": sorted(set(raw.loc[raw["Player"].isna(), "Book player"])),
-                        "fetched": dt.datetime.now().strftime("%H:%M")}
-                    st.session_state.pop(f"props_{away}_{home}", None)
+                    attach_live(oddsapi.props_frame(data), quota, ev, dt.datetime.now().strftime("%H:%M"))
             except oddsapi.OddsError as exc:
                 st.error(str(exc))
+        elif live_key not in st.session_state and slate_key(away, home) in st.session_state.slate_props:
+            # Lines already fetched with "Fetch odds for all games": no credits needed.
+            sp = st.session_state.slate_props[slate_key(away, home)]
+            attach_live(sp["raw"].copy(), {**sp["quota"], "cached": True}, sp["event"], sp["fetched"])
         live = st.session_state.get(live_key)
         if live:
             q = live["quota"]
             st.success(f"Loaded {len(live['lines'])} lines for {live['event']['away_team']} @ "
                        f"{live['event']['home_team']} at {live['fetched']}"
                        + (" (from cache, no credits used)" if q.get("cached") else
-                          f" · cost {q.get('last')} credits") + f" · credits left: {q.get('remaining')}")
+                          f" · cost {q.get('last')} credits")
+                       + (f" · credits left: {lq['remaining']}" if (lq := oddsapi.latest_quota()) else ""))
             if live["unmatched"]:
                 st.caption("Not in tonight's simulated rotation (or OUT), so skipped: "
                            + ", ".join(live["unmatched"]))
@@ -471,11 +722,14 @@ with tab_props:
                        "books post different lines and prices; this picks the best one available.")
             best = rdf.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
             best = best.assign(**{"Odds": np.where(best["Pick"] == "OVER", best["Over odds"], best["Under odds"])})
-            st.dataframe(best[["Player", "Team", "Stat", "Pick", "Line", "Odds", "Book", "Value Score",
-                               "Grade", "Sim mean", "Sim P(over)", "Book P(over)", "L10 hit"]]
+            st.dataframe(best[[c for c in ["Player", "Team", "Stat", "Pick", "Line", "Odds", "Book",
+                                           "Value Score", "Grade", "Sim mean", "Sim P(over)",
+                                           "Book P(over)", "L10 hit", "Opp vs pos", "Opp rank"]
+                               if c in best]]
                          .style.format({"Line": "{:.1f}", "Odds": "{:+.0f}", "Value Score": "{:.0f}",
                                         "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}",
-                                        "Book P(over)": "{:.0%}", "L10 hit": "{:.0%}"}, na_rep="—"),
+                                        "Book P(over)": "{:.0%}", "L10 hit": "{:.0%}",
+                                        "Opp rank": "{:.0f}"}, na_rep="—"),
                          hide_index=True, width="stretch", height=min(42 + 35 * len(best), 600))
             with st.expander("Line shopping grid (line and over / under by book)"):
                 grid = rdf.assign(Quote=lambda d: d["Line"].map("{:.1f}".format) + "  "
@@ -489,7 +743,8 @@ with tab_props:
                 "Value Score", "Grade", "Sim mean",
                 "Sim P(over)", "Book P(over)", "Edge over", "EV over", "EV under", "Season avg",
                 "Min-adj avg", "L5 avg", "L10 avg", "L10 hit", "Season hit", "Proj Min",
-                "Opp rank", "Fair over odds"]
+                "Opp vs pos", "Opp allows", "Opp rank", "Opp vs avg", "Fair over odds"]
+        show = [c for c in show if c in rdf]
 
         def color_score(v):
             if v >= 75:
@@ -507,6 +762,7 @@ with tab_props:
                 "Book P(over)": "{:.0%}", "Edge over": "{:+.1%}", "EV over": "{:+.2f}", "EV under": "{:+.2f}",
                 "Season avg": "{:.1f}", "Min-adj avg": "{:.1f}", "L5 avg": "{:.1f}", "L10 avg": "{:.1f}",
                 "L10 hit": "{:.0%}", "Season hit": "{:.0%}", "Proj Min": "{:.1f}", "Opp rank": "{:.0f}",
+                "Opp allows": "{:.1f}", "Opp vs avg": "{:+.0%}",
             }, na_rep="—").map(color_score, subset=["Value Score"]),
             hide_index=True, width="stretch", height=min(42 + 35 * len(rdf), 700))
         with st.expander("How the Value Score works"):
@@ -516,7 +772,7 @@ with tab_props:
 - **Cushion (25%)**: (minutes-adjusted average − line) ÷ the player's game-to-game SD.
 - **Hit rate (20%)**: how often the last 10 games cleared the line.
 - Pulled toward 50 when the minutes projection is shaky (high minutes SD relative to projection).
-- **EV** is profit per $1 at the listed odds using the sim's probabilities. **Opp rank**: 1 = opponent allows the most of that stat per game (best matchup).
+- **EV** is profit per $1 at the listed odds using the sim's probabilities. **Opp rank** is defense vs position: what tonight's opponent gives up per game in that stat to the player's position (**Opp vs pos**: G, F or C; a G/F gets the average of both), ranked among the 30 teams. 1 = gives up the most (best matchup), 30 = the least. **Opp allows** is that per-game total for all players at the position, and **Opp vs avg** compares it with the league average. Built from game logs; last season's games count, worth at most 20 games.
 - **Min-adj avg** = per-minute production × tonight's projected minutes.
 """)
     st.caption("Model output, not betting advice. Lines move on injury news the model can't see — "
@@ -688,7 +944,11 @@ with tab_player:
         st.metric("Value Score", f"{ev['Value Score']:.0f} ({ev['Grade']})", ev["Pick"])
         st.write(f"Sim P(over): **{pct(ev['Sim P(over)'])}** · book (no-vig) {pct(ev['Book P(over)'])}")
         st.write(f"Season {ev['Season avg']:.1f} · L10 {ev['L10 avg']:.1f} · min-adj {ev['Min-adj avg']:.1f}")
-        st.write(f"L10 hit rate: {pct(ev['L10 hit'], 0)} · Opp rank {ev.get('Opp rank', '—')}/30")
+        st.write(f"L10 hit rate: {pct(ev['L10 hit'], 0)}")
+        if "Opp rank" in ev:
+            who = "all players" if ev["Opp vs pos"] == "team" else f"{ev['Opp vs pos']} players"
+            st.write(f"vs {who}: {info['opp']} gives up **{ev['Opp allows']:.1f} {stat}** a game, "
+                     f"rank **{ev['Opp rank']}/30** (1 = most) · {ev['Opp vs avg']:+.0%} vs league average")
     with b:
         g = ds.logs[(ds.logs["PLAYER_ID"] == pid) & (ds.logs["MIN"] > 0)].head(20).copy()
         g["Value"] = sum(g[p] for p in PROP_STATS[stat])
@@ -871,3 +1131,6 @@ with tab_model:
         hide_index=True, width="stretch")
     st.caption(f"Tracking data: {ds.season} blended with {ds.prior_season}. Synergy play types fill in "
                "a few weeks into each season, so early on they lean on last season.")
+
+# Refresh the credit count now that every fetch on this run has happened.
+show_credits()

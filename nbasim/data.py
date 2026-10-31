@@ -164,6 +164,11 @@ def fetch_roster(season: str) -> pd.DataFrame:
     return df
 
 
+# Cache files that were too old to use but had to be, because NBA.com couldn't be reached:
+# {name: saved-at datetime}. Shown in the app and the slate report.
+STALE: dict = {}
+
+
 def _cached(name: str, max_age_hours: float | None, fn):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{name}.pkl")
@@ -172,7 +177,16 @@ def _cached(name: str, max_age_hours: float | None, fn):
         if max_age_hours is None or age_h < max_age_hours:
             with open(path, "rb") as fh:
                 return pickle.load(fh)
-    value = fn()
+    try:
+        value = fn()
+    except Exception:
+        # NBA.com unreachable (it blocks some networks): fall back to the last saved copy.
+        if not os.path.exists(path):
+            raise
+        STALE[name] = dt.datetime.fromtimestamp(os.path.getmtime(path))
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+    STALE.pop(name, None)
     with open(path, "wb") as fh:
         pickle.dump(value, fh)
     return value

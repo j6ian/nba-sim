@@ -63,12 +63,70 @@ def log_values(ds: Dataset, pid, parts: list[str]) -> np.ndarray:
     return sum(lg[p].values for p in parts) if len(lg) else np.array([])
 
 
-def opp_rank(ds: Dataset, opp_abbr: str, stat: str) -> tuple[float, int]:
-    """Opponent's allowed-per-game for the stat, and its rank (1 = allows the most = best matchup)."""
+POS_GROUPS = ["G", "F", "C"]
+_DVP_STATS = ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "FGA", "FG3A", "FTM"]
+_dvp_cache: dict = {}
+
+
+def position_weights(pos: str) -> dict:
+    """'G' -> {G: 1}; 'G-F' -> {G: .5, F: .5}; unknown -> {}."""
+    groups = [g[:1] for g in str(pos or "").upper().split("-") if g[:1] in POS_GROUPS]
+    return {g: groups.count(g) / len(groups) for g in set(groups)}
+
+
+def allowed_by_position(ds: Dataset, prior_games: float = 20.0) -> pd.DataFrame:
+    """What each defense gives up per game to guards, forwards and centers, from game logs.
+
+    For every game, the opponent's players' box scores are split by position (a G-F counts half
+    to each), summed, and averaged over the defense's games. Last season's games count, but are
+    worth at most `prior_games` games in total, like the rest of the model.
+    Index: (defending team, position group). Columns: per-game stats allowed.
+    """
+    key = (ds.season, ds.built_at, prior_games)
+    if key in _dvp_cache:
+        return _dvp_cache[key]
+    lg = ds.logs[ds.logs["MIN"] > 0].copy()
+    lg["DEF"] = lg["MATCHUP"].str.split().str[-1]
+    pos = ds.players["POSITION"] if "POSITION" in ds.players else pd.Series(dtype=str)
+    lg["pos"] = lg["PLAYER_ID"].map(pos)
+    season_start = pd.Timestamp(int(ds.season[:4]), 10, 1)
+    lg["cur"] = lg["GAME_DATE"] >= season_start
+    rows = []
+    for g in POS_GROUPS:
+        w = lg["pos"].map(lambda p: position_weights(p).get(g, 0.0))
+        part = lg[_DVP_STATS].mul(w, axis=0).assign(DEF=lg["DEF"], GAME_ID=lg["GAME_ID"], cur=lg["cur"])
+        per_game = part.groupby(["DEF", "GAME_ID", "cur"])[_DVP_STATS].sum().reset_index()
+        for team, tg in per_game.groupby("DEF"):
+            n_cur, n_pri = int(tg["cur"].sum()), int((~tg["cur"]).sum())
+            wp = min(1.0, prior_games / n_pri) if n_pri else 0.0
+            wt = np.where(tg["cur"], 1.0, wp)
+            avg = (tg[_DVP_STATS].mul(wt, axis=0).sum() / max(wt.sum(), 1e-9))
+            rows.append({"TEAM": team, "GROUP": g, "games": n_cur + n_pri, **avg.to_dict()})
+    df = pd.DataFrame(rows).set_index(["TEAM", "GROUP"])
+    df = df[df.index.get_level_values("TEAM").isin(ds.teams["TEAM_ABBREVIATION"])]
+    _dvp_cache[key] = df
+    return df
+
+
+def opp_rank(ds: Dataset, opp_abbr: str, stat: str, pid=None) -> tuple[float, int, float, str]:
+    """What the opponent gives up per game in this stat to the player's position, its rank among
+    the 30 teams (1 = allows the most = best matchup), how that compares with the league average
+    (+0.08 = 8% more), and the position used. Falls back to the team's overall allowed numbers
+    when the player's position isn't known."""
+    parts = PROP_STATS[stat]
+    weights = position_weights(ds.players["POSITION"].get(pid, "")) if pid is not None and \
+        "POSITION" in ds.players else {}
+    if weights:
+        dvp = allowed_by_position(ds)
+        val = sum(sum(dvp.xs(g, level="GROUP")[p] for p in parts) * w for g, w in weights.items())
+        if opp_abbr in val.index:
+            ranks = val.rank(ascending=False, method="min")
+            label = "/".join(sorted(weights, key=POS_GROUPS.index))
+            return float(val[opp_abbr]), int(ranks[opp_abbr]), float(val[opp_abbr] / val.mean() - 1), label
     col = OPP_ALLOWED[stat]
     t = ds.teams.set_index("TEAM_ABBREVIATION")
     ranks = t[col].rank(ascending=False, method="min")
-    return float(t.loc[opp_abbr, col]), int(ranks.loc[opp_abbr])
+    return float(t.loc[opp_abbr, col]), int(ranks.loc[opp_abbr]), float(t.loc[opp_abbr, col] / t[col].mean() - 1), "team"
 
 
 def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float,
@@ -136,9 +194,11 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
         "Cushion (SD)": cushion, "Min conf": min_conf,
     }
     if opp_abbr:
-        allowed, rank = opp_rank(ds, opp_abbr, stat)
+        allowed, rank, vs_avg, pos = opp_rank(ds, opp_abbr, stat, pid)
         out["Opp allows"] = allowed
         out["Opp rank"] = rank
+        out["Opp vs avg"] = vs_avg
+        out["Opp vs pos"] = pos
     return out
 
 

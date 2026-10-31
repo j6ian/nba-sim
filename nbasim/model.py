@@ -76,6 +76,7 @@ def minutes_table(ds: Dataset, team: str) -> pd.DataFrame:
 
 PLAY_WINDOW = 10          # team games used to estimate how often a player gets in
 PLAY_PRIOR_GAMES = 1.0    # weight of the minutes-based prior, in games
+MIN_DRESSED = 7          # fewest players who see the floor in a simulated game
 
 
 def play_probability(proj: np.ndarray, played: np.ndarray, k: int) -> np.ndarray:
@@ -134,7 +135,14 @@ def sample_minutes(rng, proj: np.ndarray, sd: np.ndarray, p_play: np.ndarray, n:
     proj = np.asarray(proj, float)
     p = np.clip(np.asarray(p_play, float), 1e-3, 1.0)
     plays = rng.random((n, len(proj))) < p[None, :]
-    plays[:, np.argsort(-proj)[:5]] = True       # always a full five on the floor
+    plays[:, np.argsort(-np.where(p >= 1.0 - 1e-9, proj, -1.0))[:5]] = True   # a full five
+    # With injuries thinning the bench, the random DNPs can leave too few players to cover 240
+    # minutes; then the next men up by projected minutes play.
+    for j in np.argsort(-proj):
+        short = plays.sum(1) < MIN_DRESSED
+        if not short.any() or proj[j] < 0.5:
+            break
+        plays[short, j] = True
     plays[:, proj < 0.5] = False
     z = rng.normal(0, 1, (n, len(proj))) * sd[None, :]
     c = proj / p
@@ -236,15 +244,27 @@ def roles(proj: np.ndarray, positions: list, rates: np.ndarray | None = None) ->
     return starter, deep, big, guard, anchor
 
 
-def redistribute_minutes(active: pd.DataFrame, out: pd.DataFrame, positions: dict) -> np.ndarray:
-    """Hand an absent player's minutes to teammates, favoring the same position group."""
+SOFT_MAX_MIN = 38.0   # past this, coaches rarely add minutes for a missing teammate
+
+
+def redistribute_minutes(active: pd.DataFrame, out: pd.DataFrame, positions: dict,
+                         p_play: np.ndarray | None = None) -> np.ndarray:
+    """Hand an absent player's minutes to teammates, favoring the same position group.
+
+    Coaches mostly give a missing player's minutes to the bench, not to starters already near
+    their limit, so each teammate's share is his minutes times his headroom below SOFT_MAX_MIN
+    (minutes when he plays). Spreading in proportion to minutes alone pushed every starter to the
+    42-minute cap when two or three teammates were out.
+    """
     mins = active["Proj Min"].values.astype(float).copy()
-    groups = np.array([_group(positions[p]) for p in active["PLAYER_ID"]])
+    p = np.ones(len(mins)) if p_play is None else np.clip(np.asarray(p_play, float), 0.05, 1.0)
+    groups = np.array([_group(positions[pid]) for pid in active["PLAYER_ID"]])
     for _, r in out.iterrows():
         freed = float(r["Proj Min"])
         if freed <= 0:
             continue
-        w = mins * np.where(groups == _group(positions[r["PLAYER_ID"]]), 2.0, 1.0)
+        headroom = np.clip(SOFT_MAX_MIN - mins / p, 1.0, None)
+        w = mins * headroom * np.where(groups == _group(positions[r["PLAYER_ID"]]), 2.0, 1.0)
         mins += freed * w / max(w.sum(), 1e-9)
     return fit_rotation(mins)
 
@@ -353,14 +373,17 @@ def team_profile(ds: Dataset, abbr: str, minutes: pd.DataFrame, use_wowy: bool =
     ft_pct = (pl["FTM"].values + FT_SHRINK * lg["FT_PCT"]) / (pl["FTA"].values + FT_SHRINK)
 
     # Proj Min is minutes when he plays; the rotation is fit on expected minutes (x Play %).
-    # The top five always play (someone has to start), so they keep Play % = 1.
+    # The top five healthy players always play (someone has to start), so they keep Play % = 1;
+    # a questionable or doubtful player keeps his reduced Play %.
     p_play = (m["Play %"].fillna(1.0).values.astype(float).clip(0.05, 1.0) if "Play %" in m
               else np.ones(len(m)))
-    p_play[np.argsort(-(m["Proj Min"].values * p_play))[:5]] = 1.0
+    hurt = (m["Injury"].fillna("").astype(str).str.match(r"(Doubtful|Questionable|Day-To-Day)\b").values
+            if "Injury" in m else np.zeros(len(m), bool))
+    p_play[np.argsort(-np.where(hurt, -1.0, m["Proj Min"].values * p_play))[:5]] = 1.0
     m["Proj Min"] = m["Proj Min"].values * p_play
     if "Play %" in out:
         out = out.assign(**{"Proj Min": out["Proj Min"] * out["Play %"].fillna(1.0)})
-    proj = redistribute_minutes(m, out, positions)
+    proj = redistribute_minutes(m, out, positions, p_play)
     pos_list = [positions[p] for p in m["PLAYER_ID"]]
     starter, deep, big, guard, anchor = roles(proj, pos_list, _play_rate(pl))
     lw = lineup_weights(ds, abbr, m, out, proj, positions, use_wowy=use_wowy, tr=tr, w_pot=w_pot)
