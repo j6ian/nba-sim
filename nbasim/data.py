@@ -121,8 +121,7 @@ def _flatten_zone_frame(df: pd.DataFrame, prefix: str = "") -> pd.DataFrame:
 
 def fetch_season(season: str) -> dict[str, pd.DataFrame]:
     from nba_api.stats.endpoints import (leaguedashplayershotlocations, leaguedashplayerstats,
-                                         leaguedashteamshotlocations, leaguedashteamstats,
-                                         playergamelogs)
+                                         leaguedashteamshotlocations, leaguedashteamstats)
 
     out: dict[str, pd.DataFrame] = {}
     out["p_base"] = _call(leaguedashplayerstats.LeagueDashPlayerStats, season=season,
@@ -145,10 +144,16 @@ def fetch_season(season: str) -> dict[str, pd.DataFrame]:
     out["t_zone_opp"] = _flatten_zone_frame(
         _call(leaguedashteamshotlocations.LeagueDashTeamShotLocations, season=season,
               distance_range="By Zone", measure_type_simple="Opponent")[0], prefix="OPP_")
+    out["logs"] = fetch_logs(season)
+    return out
+
+
+def fetch_logs(season: str) -> pd.DataFrame:
+    """Every player's regular-season game log for a season (one quick request)."""
+    from nba_api.stats.endpoints import playergamelogs
     logs = _call(playergamelogs.PlayerGameLogs, season_nullable=season,
                  season_type_nullable="Regular Season")[0]
-    out["logs"] = logs[[c for c in LOG_COLS if c in logs.columns]].copy()
-    return out
+    return logs[[c for c in LOG_COLS if c in logs.columns]].copy()
 
 
 def fetch_roster(season: str) -> pd.DataFrame:
@@ -261,6 +266,7 @@ class Dataset:
     logs: pd.DataFrame         # game logs for both seasons, newest first
     league: dict               # league-average rates
     built_at: str
+    logs_through: str = ""     # date of the newest game in the logs
 
 
 def _blend_players(cur: pd.DataFrame, prior: pd.DataFrame, prior_games: float) -> pd.DataFrame:
@@ -328,6 +334,19 @@ def load_dataset(season: str | None = None, prior_games: float = 20.0,
         cur_raw = _cached(f"season_{season}", 0 if refresh else 6, lambda: fetch_season(season))
     except RuntimeError:
         cur_raw = None  # season not started / endpoint empty
+    if cur_raw is not None:
+        # Game logs drive hit rates and "last N games", so they refresh every hour (one quick
+        # request) instead of with the 6-hour season totals; otherwise last night's games could
+        # be missing for most of the next day.
+        say("Loading latest game logs...")
+        try:
+            fresh = _cached(f"logs_{season}", 0 if refresh else 1, lambda: fetch_logs(season))
+            # Use whichever copy reaches the later game (a saved copy can be the older one).
+            if len(fresh) and (not len(cur_raw["logs"]) or
+                               str(fresh["GAME_DATE"].max()) >= str(cur_raw["logs"]["GAME_DATE"].max())):
+                cur_raw = {**cur_raw, "logs": fresh}
+        except Exception:
+            pass  # keep the logs saved with the season totals
     say("Loading current rosters...")
     roster = _cached(f"roster2_{season}", 0 if refresh else 12, lambda: fetch_roster(season))
 
@@ -357,8 +376,10 @@ def load_dataset(season: str | None = None, prior_games: float = 20.0,
     teams["TEAM_ABBREVIATION"] = [abbr.get(i, "?") for i in teams.index]
 
     logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"])
-    logs = logs.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    # Newest first; ties on a date broken by game id so the order never shuffles.
+    logs = logs.sort_values(["GAME_DATE", "GAME_ID"], ascending=False).reset_index(drop=True)
 
     league = _league(players, teams, cur_raw, prior_raw)
     return Dataset(season=season, prior_season=prior, players=players, teams=teams, logs=logs,
-                   league=league, built_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M"))
+                   league=league, built_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                   logs_through=logs["GAME_DATE"].max().strftime("%Y-%m-%d") if len(logs) else "")

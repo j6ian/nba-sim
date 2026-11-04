@@ -4,7 +4,7 @@ Value Score (0-100, for the better side):
   50 = no edge. Built from four parts, each squashed so no single input dominates:
     - Sim edge (55%):     sim probability minus the book's no-vig implied probability
     - Cushion (25%):      (minutes-adjusted average - line) / game-to-game SD
-    - Hit rate (20%):     share of the last 10 games that cleared the line
+    - Hit rate (20%):     share of the last 10 games over the line (shown for the picked side)
   then pulled toward 50 when the minutes projection is shaky (high minutes SD).
 """
 from __future__ import annotations
@@ -163,6 +163,8 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
     l10 = hist[:10]
     hit10 = float((l10 > line).mean()) if len(l10) else np.nan
     hit_season = float((hist > line).mean()) if len(hist) else np.nan
+    under10 = float((l10 < line).mean()) if len(l10) else np.nan
+    under_season = float((hist < line).mean()) if len(hist) else np.nan
     cushion = (min_adj_avg - line) / max(sd, 0.5)
 
     def squash(x, scale):
@@ -183,7 +185,11 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
         "Line": line, "Season avg": season_avg, "Min-adj avg": min_adj_avg,
         "L5 avg": float(hist[:5].mean()) if len(hist) else np.nan,
         "L10 avg": float(l10.mean()) if len(l10) else np.nan,
-        "L10 hit": hit10, "Season hit": hit_season,
+        # Hit rates are for the picked side (an UNDER pick shows how often he stayed under).
+        "L10 hit": hit10 if side == "OVER" else under10,
+        "Season hit": hit_season if side == "OVER" else under_season,
+        "L10 over hit": hit10,
+        "L10": " ".join(f"{v:g}" for v in l10),
         "Sim mean": float(sim_vals.mean()), "Sim median": float(np.median(sim_vals)),
         "Sim P(over)": p_over, "Sim P(under)": p_under, "P(push)": p_push,
         "Raw sim P(over)": sim_over,

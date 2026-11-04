@@ -38,7 +38,8 @@ BOX = ["MIN", "PTS", "REB", "AST", "FG3M", "FGA", "FG3A", "FTA", "STL", "BLK", "
 
 # --------------------------------------------------------------------------- data
 
-@st.cache_resource(show_spinner=False)
+# Reloaded every hour so a long-running app picks up new games (game logs refresh hourly on disk).
+@st.cache_resource(show_spinner=False, ttl=3600, max_entries=2)
 def get_dataset(season: str, prior_games: float, refresh_token: int):
     return load_dataset(season, prior_games=prior_games, refresh=refresh_token > 0)
 
@@ -48,7 +49,7 @@ def get_minutes(_ds, team: str, built_at: str):
     return minutes_table(_ds, team)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=2)
 def get_tracking(_ds, built_at: str, prior_games: float, refresh_token: int):
     return load_tracking(_ds, prior_games=prior_games, refresh=refresh_token > 0)
 
@@ -160,7 +161,8 @@ def open_game(a: str, h: str):
 
 away = st.sidebar.selectbox("Away team", abbrs, key="away_sel", format_func=fmt)
 home = st.sidebar.selectbox("Home team", abbrs, key="home_sel", format_func=fmt)
-st.sidebar.caption(f"Data: {ds.season} blended with {ds.prior_season} · built {ds.built_at}")
+st.sidebar.caption(f"Data: {ds.season} blended with {ds.prior_season} · built {ds.built_at}"
+                   f" · games through {ds.logs_through or '?'}")
 
 # Odds settings are shared by the Props tab and the slate's "Pull props for all games".
 for k, d in (("odds_key", oddsapi.api_key() or ""), ("odds_books", list(oddsapi.DEFAULT_BOOKS)),
@@ -745,7 +747,7 @@ with tab_props:
         show = ["Player", "Team", "Stat", "Book", "Line", "Over odds", "Under odds", "Pick",
                 "Value Score", "Grade", "Sim mean",
                 "Sim P(over)", "Book P(over)", "Edge over", "EV over", "EV under", "Season avg",
-                "Min-adj avg", "L5 avg", "L10 avg", "L10 hit", "Season hit", "Proj Min",
+                "Min-adj avg", "L5 avg", "L10 avg", "L10 hit", "Season hit", "L10", "Proj Min",
                 "Opp vs pos", "Opp allows", "Opp rank", "Opp vs avg", "Fair over odds"]
         show = [c for c in show if c in rdf]
 
@@ -774,6 +776,7 @@ with tab_props:
 - **Sim edge (55%)**: simulated probability of the pick minus the book's no-vig implied probability.
 - **Cushion (25%)**: (minutes-adjusted average − line) ÷ the player's game-to-game SD.
 - **Hit rate (20%)**: how often the last 10 games cleared the line.
+- **L10 hit** and **Season hit** are for the side in **Pick**: for an UNDER, how often he stayed under. A game exactly on the line (a push) isn't a hit. **L10** lists his last 10 games, newest first.
 - Pulled toward 50 when the minutes projection is shaky (high minutes SD relative to projection).
 - **EV** is profit per $1 at the listed odds using the sim's probabilities. **Opp rank** is defense vs position: what tonight's opponent gives up per game in that stat to the player's position (**Opp vs pos**: G, F or C; a G/F gets the average of both), ranked among the 30 teams. 1 = gives up the most (best matchup), 30 = the least. **Opp allows** is that per-game total for all players at the position, and **Opp vs avg** compares it with the league average. Built from game logs; last season's games count, worth at most 20 games.
 - **Min-adj avg** = per-minute production × tonight's projected minutes.
@@ -947,7 +950,7 @@ with tab_player:
         st.metric("Value Score", f"{ev['Value Score']:.0f} ({ev['Grade']})", ev["Pick"])
         st.write(f"Sim P(over): **{pct(ev['Sim P(over)'])}** · book (no-vig) {pct(ev['Book P(over)'])}")
         st.write(f"Season {ev['Season avg']:.1f} · L10 {ev['L10 avg']:.1f} · min-adj {ev['Min-adj avg']:.1f}")
-        st.write(f"L10 hit rate: {pct(ev['L10 hit'], 0)}")
+        st.write(f"L10 hit rate ({ev['Pick'].lower()}): {pct(ev['L10 hit'], 0)} · last 10: {ev['L10']}")
         if "Opp rank" in ev:
             who = "all players" if ev["Opp vs pos"] == "team" else f"{ev['Opp vs pos']} players"
             st.write(f"vs {who}: {info['opp']} gives up **{ev['Opp allows']:.1f} {stat}** a game, "
@@ -1030,7 +1033,7 @@ with tab_hits:
     opp_opts = ["Any team", "Tonight's opponent"] + abbrs
     hr_opp = h3.selectbox("Against", opp_opts, key="hr_opp", format_func=lambda o: o if o in opp_opts[:2] else fmt(o))
     hr_venue = h4.radio("Venue", ["All", "Home", "Away"], horizontal=True, key="hr_venue")
-    h5, h6, h7, h8 = st.columns(4)
+    h5, h6, h7, h8, h9 = st.columns(5)
     hr_stats = h5.multiselect("Stats", list(hitrates.LADDERS), default=["PTS", "REB", "AST", "3PM", "PRA"],
                               key="hr_stats")
     hr_min_games = h6.number_input("Minimum games", 1, 82, min(5, hr_n), key="hr_min_g",
@@ -1038,6 +1041,9 @@ with tab_hits:
                                         "(a 2-for-2 isn't a 100% hit rate worth trusting).")
     hr_min_mpg = h7.number_input("Minimum minutes a game", 0.0, 40.0, 15.0, 1.0, key="hr_min_mpg")
     hr_out = h8.toggle("Hide players OUT tonight", True, key="hr_hide_out")
+    hr_season_only = h9.toggle("This season only", False, key="hr_season_only",
+                               help="Off: early in the season, last season's games fill out the last N. "
+                                    "On: only this season's games count.")
 
     games_in = ([(g["away"], g["home"]) for g in slate] if hr_scope == "All games on the slate" and slate
                 else [(away, home)])
@@ -1056,9 +1062,11 @@ with tab_hits:
         st.caption("No sportsbook lines fetched for these games yet, so showing the alt-line ladder.")
     if hr_mode == "Sportsbook lines":
         book = book[book["Stat"].isin(hr_stats)]
-        hits = hitrates.book_line_hits(ds, players, book, hr_n, opp_mode, hr_venue, hr_min_games)
+        hits = hitrates.book_line_hits(ds, players, book, hr_n, opp_mode, hr_venue, hr_min_games,
+                                       hr_season_only)
     else:
-        hits = hitrates.ladder_hits(ds, players, hr_stats, hr_n, opp_mode, hr_venue, hr_min_games)
+        hits = hitrates.ladder_hits(ds, players, hr_stats, hr_n, opp_mode, hr_venue, hr_min_games,
+                                    hr_season_only)
 
     if hits.empty:
         st.info("Nothing at 80% or better with these filters. Try more stats, fewer games back, or "
@@ -1067,8 +1075,8 @@ with tab_hits:
         status = {p["name"]: p["status"] for p in players}
         hits["Status"] = hits["Player"].map(status).replace("", "—")
         cols = ["Player", "Team", "Opp", "Status", "Stat", "Side", "Line", "Hits", "Hit %", "Avg", "Low",
-                "Best odds", "Book", "Recent"]
-        fmt_map = {"Hit %": "{:.0%}", "Avg": "{:.1f}", "Low": "{:g}", "Best odds": "{:+.0f}"}
+                "High", "Best odds", "Book", "Last game", "Recent"]
+        fmt_map = {"Hit %": "{:.0%}", "Avg": "{:.1f}", "Low": "{:g}", "High": "{:g}", "Best odds": "{:+.0f}"}
         for _, label in hitrates.TIERS:
             t = hits[hits["Tier"] == label].sort_values(["Games", "Avg"], ascending=False)
             st.subheader(f"{label} hit rate ({len(t)})")
@@ -1080,7 +1088,11 @@ with tab_hits:
         opp_note = {"Any team": "any opponent", "Tonight's opponent": "tonight's opponent"}.get(hr_opp, hr_opp)
         st.caption(f"Last {hr_n} games vs {opp_note}"
                    + (f", {hr_venue.lower()} games only" if hr_venue != "All" else "")
-                   + ". **Recent** lists his values newest first. Alt lines show the highest round "
+                   + (" (this season only)" if hr_season_only else "")
+                   + f". Game logs through **{ds.logs_through or '?'}**. **Recent** lists his values "
+                     "newest first; ✗ marks a game that missed the line and = a push (exactly the "
+                     "line, which doesn't count as a hit). An 80%+ "
+                     "row can still show misses: 8 of 10 is 80%. Alt lines show the highest round "
                      "line he cleared at each rate; a line in a higher tier isn't repeated below. "
                      "Hit rates ignore matchup and minutes changes: check the Player Props tab's "
                      "Value Score and tonight's injuries too.")
