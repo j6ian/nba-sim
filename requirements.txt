@@ -3,3 +3,4 @@ pandas
 streamlit
 altair
 nba_api
+tzdata
