@@ -23,6 +23,7 @@ import requests
 
 from .data import CACHE_DIR
 from .odds import match_players
+from .timefmt import fmt
 
 URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 MAX_AGE_MIN = 20
@@ -81,7 +82,7 @@ def fetch_report() -> tuple[pd.DataFrame, str | None, str]:
     if data and data.get("timestamp"):
         ts = pd.to_datetime(data["timestamp"], utc=True, errors="coerce")
         if ts is not pd.NaT:
-            stamp = ts.tz_convert("US/Eastern").strftime("%b %-d %-I:%M %p ET")
+            stamp = fmt(ts.tz_convert("US/Eastern"), "%b %-d %-I:%M %p ET")
     return df, err, stamp
 
 

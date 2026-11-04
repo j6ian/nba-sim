@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 
 from .data import CACHE_DIR
+from .timefmt import fmt
 
 SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
@@ -162,5 +163,5 @@ def status_line(g: dict) -> str:
     if g["status"] >= 2 and g.get("status_text"):
         return g["status_text"]
     if g["start"] is not None:
-        return g["start"].strftime("%-I:%M %p ET")
+        return fmt(g["start"], "%-I:%M %p ET")
     return g.get("status_text") or "TBD"

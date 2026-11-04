@@ -42,6 +42,7 @@ from nbasim.model import minutes_table, set_tracking, team_profile  # noqa: E402
 from nbasim.props import PROP_STATS, evaluate_prop  # noqa: E402
 from nbasim.sim import simulate  # noqa: E402
 from nbasim.tracking import load_tracking  # noqa: E402
+from nbasim.timefmt import fmt  # noqa: E402
 
 REPORT_DIR = os.path.join(ROOT, "reports")
 KEY_TEAMMATE_MPG = 25.0   # a teammate this big being out shifts usage a lot -> flag the prop
@@ -245,8 +246,8 @@ def write_report(path, game_date, games, best, game_lines, meta):
     a_b = best[best["Grade"].isin(["A", "B"])]
     parts = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
              f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-             f"<title>NBA Slate {game_date:%b %-d}</title><style>{CSS}</style></head><body><main>",
-             f"<h1>NBA slate: {game_date:%A, %B %-d}</h1>",
+             f"<title>NBA Slate {fmt(game_date, '%b %-d')}</title><style>{CSS}</style></head><body><main>",
+             f"<h1>NBA slate: {fmt(game_date, '%A, %B %-d')}</h1>",
              f"<p class='mut'>{len(games)} games · {meta['sims']:,} sims each · generated {meta['generated']} · "
              f"prop types: {', '.join(meta['markets'])} · {meta['credits_used']} Odds API credits used"
              + (f", {meta['credits_left']} left" if meta.get('credits_left') is not None else "") + "</p>"]
@@ -327,7 +328,7 @@ def main():
     warnings_ = []
     if nbadata.STALE:
         oldest = min(nbadata.STALE.values())
-        warnings_.append(f"NBA.com couldn't be reached, so stats are from {oldest:%b %-d %-I:%M %p}. "
+        warnings_.append(f"NBA.com couldn't be reached, so stats are from {fmt(oldest, '%b %-d %-I:%M %p')}. "
                          "Recent games, minutes and Play % may be out of date.")
 
     slate, source = schedule.games_on(game_date, names)
@@ -394,7 +395,7 @@ def main():
         allp.to_csv(f"{stem}_all_lines.csv", index=False)
         best = allp.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
     best.to_csv(f"{stem}.csv", index=False)
-    meta = {"sims": args.sims, "generated": dt.datetime.now().strftime("%b %-d %-I:%M %p"),
+    meta = {"sims": args.sims, "generated": fmt(dt.datetime.now(), "%b %-d %-I:%M %p"),
             "markets": markets, "credits_used": used,
             "credits_left": (oddsapi.latest_quota() or {}).get("remaining"), "warnings": warnings_,
             "top": args.top}

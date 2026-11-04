@@ -27,6 +27,7 @@ from nbasim.tracking import PLAY_TYPES, PT_LABELS, load_tracking
 from nbasim.props import PROP_STATS, default_line, evaluate_prop, log_values, prob_to_american
 from nbasim.lineups import on_off_usage, top_lineups
 from nbasim.sim import simulate
+from nbasim.timefmt import fmt
 from nbasim.wowy import player_split_games, split_summary, teammate_table
 from nbasim import hitrates
 
@@ -282,7 +283,7 @@ def show_credits():
                         f"once every 10 minutes) · {updated}{left}")
 
 
-day_label = "Today's games" if game_date == dt.date.today() else f"Games on {game_date:%a, %b %-d}"
+day_label = "Today's games" if game_date == dt.date.today() else f"Games on {fmt(game_date, '%a, %b %-d')}"
 with st.expander(f"📅 {day_label} ({len(slate)})", expanded=True):
     if not slate:
         st.caption(f"No games found for this date ({slate_source}). Change the game date in the "
@@ -1138,7 +1139,7 @@ with tab_wowy:
             over = int((vals > ww_line).sum())
             c2.metric(f"Over {ww_line:g} {ww_stat}", f"{over}/{len(vals)} ({over / len(vals):.0%})",
                       help=f"Average {vals.mean():.1f} without them")
-            log = wo_g.assign(Date=wo_g["GAME_DATE"].dt.strftime("%b %-d, %Y"),
+            log = wo_g.assign(Date=wo_g["GAME_DATE"].map(lambda d: fmt(d, "%b %-d, %Y")),
                               PRA=wo_g["PTS"] + wo_g["REB"] + wo_g["AST"])
             st.markdown(f"**Games without {out_names}**")
             st.dataframe(log[["Date", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST", "FG3M", "PRA", "FGA", "FTA"]]
