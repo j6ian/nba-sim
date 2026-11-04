@@ -5,7 +5,8 @@ Two kinds of lines:
   * Alt-line ladder: round thresholds (10+ / 15+ / 20+ points...). For each player and stat, each
     tier shows the highest threshold he cleared at that rate, which is how "safe" alt lines and
     ladders are usually picked.
-Filters: how many games back, opponent (filtered first, then the last N of those games), venue.
+Filters: how many games back, opponent (filtered first, then the last N of those games), venue,
+and whether last season's games may fill out the sample.
 """
 from __future__ import annotations
 
@@ -26,16 +27,28 @@ LADDERS = {
 TIERS = [(1.0, "100%"), (0.9, "90%+"), (0.8, "80%+")]
 
 
-def player_games(ds: Dataset, pid, n: int, opp: str | None = None, venue: str = "All") -> pd.DataFrame:
-    """His last `n` games (most recent first), optionally only vs `opp` and/or home/away."""
+RECENT_SHOWN = 20  # values listed in the Recent column
+
+
+def player_games(ds: Dataset, pid, n: int, opp: str | None = None, venue: str = "All",
+                 season_only: bool = False) -> pd.DataFrame:
+    """His last `n` games (most recent first), optionally only vs `opp` and/or home/away, and
+    optionally only this season's games."""
     g = ds.logs[(ds.logs["PLAYER_ID"] == pid) & (ds.logs["MIN"] > 0)]
+    if season_only:
+        g = g[g["GAME_DATE"] >= _season_start(ds)]
     if opp:
         g = g[g["MATCHUP"].str.split().str[-1] == opp]
     if venue == "Home":
         g = g[g["MATCHUP"].str.contains(" vs. ", regex=False)]
     elif venue == "Away":
         g = g[g["MATCHUP"].str.contains(" @ ", regex=False)]
-    return g.sort_values("GAME_DATE", ascending=False).head(n)
+    return g.sort_values(["GAME_DATE", "GAME_ID"], ascending=False).head(n)
+
+
+def _season_start(ds: Dataset) -> pd.Timestamp:
+    """Current season's games are on or after August 1 of its first year."""
+    return pd.Timestamp(int(ds.season[:4]), 8, 1)
 
 
 def stat_values(games: pd.DataFrame, stat: str) -> np.ndarray:
@@ -49,21 +62,34 @@ def tier_of(rate: float) -> str | None:
     return None
 
 
-def _row(name, team, opp, stat, vals, line_label, side, hits, extra=None):
+def recent_text(vals: np.ndarray, hit: np.ndarray, push: np.ndarray | None = None) -> str:
+    """Values newest first; a miss is marked ✗ and a push (exactly the line) =."""
+    out = []
+    for i, v in enumerate(vals[:RECENT_SHOWN]):
+        mark = "" if hit[i] else "=" if push is not None and push[i] else "✗"
+        out.append(f"{v:g}{mark}")
+    return " ".join(out)
+
+
+def _row(name, team, opp, stat, games, vals, line_label, side, hit, push=None, extra=None):
+    hits = int(hit.sum())
+    pushes = int(push.sum()) if push is not None else 0
     return {"Player": name, "Team": team, "Opp": opp, "Stat": stat, "Line": line_label, "Side": side,
-            "Hit %": hits / len(vals), "Hits": f"{hits}/{len(vals)}", "Games": len(vals),
-            "Avg": float(vals.mean()), "Low": float(vals.min()),
-            "Recent": " ".join(f"{v:g}" for v in vals[:10]), **(extra or {})}
+            "Hit %": hits / len(vals), "Hits": f"{hits}/{len(vals)}" + (f" ({pushes} push)" if pushes else ""),
+            "Games": len(vals), "Avg": float(vals.mean()), "Low": float(vals.min()),
+            "High": float(vals.max()),
+            "Last game": pd.Timestamp(games["GAME_DATE"].iloc[0]).strftime("%b %d").replace(" 0", " "),
+            "Recent": recent_text(vals, hit, push), **(extra or {})}
 
 
 def ladder_hits(ds: Dataset, players: list[dict], stats: list[str], n: int, opp_mode: str | None,
-                venue: str, min_games: int) -> pd.DataFrame:
+                venue: str, min_games: int, season_only: bool = False) -> pd.DataFrame:
     """Alt-line tiers. players: dicts with pid, name, team, opp (tonight's opponent).
     opp_mode: None (any team), "tonight" (each player's opponent tonight) or a team abbreviation."""
     rows = []
     for p in players:
         opp = p["opp"] if opp_mode == "tonight" else opp_mode
-        g = player_games(ds, p["pid"], n, opp, venue)
+        g = player_games(ds, p["pid"], n, opp, venue, season_only)
         if len(g) < min_games:
             continue
         for stat in stats:
@@ -75,13 +101,14 @@ def ladder_hits(ds: Dataset, players: list[dict], stats: list[str], n: int, opp_
                     continue
                 t = max(ok)
                 shown.add(t)
-                rows.append({"Tier": label, **_row(p["name"], p["team"], p["opp"], stat, vals,
-                                                   f"{t}+", "Over", int((vals >= t).sum()))})
+                rows.append({"Tier": label, **_row(p["name"], p["team"], p["opp"], stat, g, vals,
+                                                   f"{t}+", "Over", vals >= t)})
     return pd.DataFrame(rows)
 
 
 def book_line_hits(ds: Dataset, players: list[dict], lines: pd.DataFrame, n: int,
-                   opp_mode: str | None, venue: str, min_games: int) -> pd.DataFrame:
+                   opp_mode: str | None, venue: str, min_games: int,
+                   season_only: bool = False) -> pd.DataFrame:
     """Hit rates at tonight's sportsbook lines (the most common line across books), both sides.
     lines: Player (sim name), Stat, Line, Over odds, Under odds, Book."""
     by_name = {p["name"]: p for p in players}
@@ -91,19 +118,19 @@ def book_line_hits(ds: Dataset, players: list[dict], lines: pd.DataFrame, n: int
         if p is None or stat not in PROP_STATS:
             continue
         opp = p["opp"] if opp_mode == "tonight" else opp_mode
-        g = player_games(ds, p["pid"], n, opp, venue)
+        g = player_games(ds, p["pid"], n, opp, venue, season_only)
         if len(g) < min_games:
             continue
         vals = stat_values(g, stat)
         line = float(grp["Line"].mode().iloc[0])
         at = grp[grp["Line"] == line]
-        for side, hits, col in (("Over", int((vals > line).sum()), "Over odds"),
-                                ("Under", int((vals < line).sum()), "Under odds")):
-            rate = hits / len(vals)
+        push = vals == line
+        for side, hit, col in (("Over", vals > line, "Over odds"), ("Under", vals < line, "Under odds")):
+            rate = hit.sum() / len(vals)
             tier = tier_of(rate)
             if tier is None:
                 continue
             best = at.loc[at[col].idxmax()]
-            rows.append({"Tier": tier, **_row(name, p["team"], p["opp"], stat, vals, f"{line:g}", side, hits,
-                                              {"Best odds": float(best[col]), "Book": best["Book"]})})
+            rows.append({"Tier": tier, **_row(name, p["team"], p["opp"], stat, g, vals, f"{line:g}", side,
+                                              hit, push, {"Best odds": float(best[col]), "Book": best["Book"]})})
     return pd.DataFrame(rows)
