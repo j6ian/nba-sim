@@ -30,6 +30,7 @@ from nbasim.sim import simulate
 from nbasim.timefmt import fmt
 from nbasim.wowy import player_split_games, split_summary, teammate_table
 from nbasim import hitrates
+from nbasim import picks as favs
 
 st.set_page_config(page_title="NBA Matchup Simulator", page_icon="🏀", layout="wide")
 
@@ -358,9 +359,10 @@ if home == away:
 T = ds.teams.set_index("TEAM_ABBREVIATION")
 st.title(f"{names[away]} @ {names[home]}")
 
-(tab_sim, tab_props, tab_player, tab_hits, tab_wowy, tab_match, tab_rot, tab_watch,
+(tab_sim, tab_props, tab_picks, tab_player, tab_hits, tab_wowy, tab_match, tab_rot, tab_watch,
  tab_model) = st.tabs(
-    ["🎲 Game Sim", "💰 Player Props", "🔍 Player Deep Dive", "🎯 Hit Rates", "🔀 With / Without",
+    ["🎲 Game Sim", "💰 Player Props", "⭐ My Picks", "🔍 Player Deep Dive", "🎯 Hit Rates",
+     "🔀 With / Without",
      "📊 Matchup", "⏱ Rotations", "📺 Watch a Game", "🧠 Model & Data"])
 
 sched = {}
@@ -729,7 +731,8 @@ with tab_props:
                        "books post different lines and prices; this picks the best one available.")
             best = rdf.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
             best = best.assign(**{"Odds": np.where(best["Pick"] == "OVER", best["Over odds"], best["Under odds"])})
-            st.dataframe(best[[c for c in ["Player", "Team", "Stat", "Pick", "Line", "Odds", "Book",
+            best = best.reset_index(drop=True)
+            best_sel = st.dataframe(best[[c for c in ["Player", "Team", "Stat", "Pick", "Line", "Odds", "Book",
                                            "Value Score", "Grade", "Sim mean", "Sim P(over)",
                                            "Book P(over)", "L10 hit", "Opp vs pos", "Opp rank"]
                                if c in best]]
@@ -737,7 +740,8 @@ with tab_props:
                                         "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}",
                                         "Book P(over)": "{:.0%}", "L10 hit": "{:.0%}",
                                         "Opp rank": "{:.0f}"}, na_rep="—"),
-                         hide_index=True, width="stretch", height=min(42 + 35 * len(best), 600))
+                         hide_index=True, width="stretch", height=min(42 + 35 * len(best), 600),
+                         on_select="rerun", selection_mode="multi-row", key=f"fav_best_{key}")
             with st.expander("Line shopping grid (line and over / under by book)"):
                 grid = rdf.assign(Quote=lambda d: d["Line"].map("{:.1f}".format) + "  "
                                   + d["Over odds"].map("{:+.0f}".format) + " / "
@@ -762,7 +766,8 @@ with tab_props:
                 return "background-color: rgba(218,165,32,0.25)"
             return ""
 
-        st.dataframe(
+        rdf = rdf.reset_index(drop=True)
+        all_sel = st.dataframe(
             rdf[show].style.format({
                 "Line": "{:.1f}", "Over odds": "{:+.0f}", "Under odds": "{:+.0f}",
                 "Value Score": "{:.0f}", "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}",
@@ -771,7 +776,34 @@ with tab_props:
                 "L10 hit": "{:.0%}", "Season hit": "{:.0%}", "Proj Min": "{:.1f}", "Opp rank": "{:.0f}",
                 "Opp allows": "{:.1f}", "Opp vs avg": "{:+.0%}",
             }, na_rep="—").map(color_score, subset=["Value Score"]),
-            hide_index=True, width="stretch", height=min(42 + 35 * len(rdf), 700))
+            hide_index=True, width="stretch", height=min(42 + 35 * len(rdf), 700),
+            on_select="rerun", selection_mode="multi-row", key=f"fav_all_{key}")
+
+        # Favorites: tick rows in either table, then save them to the My Picks tab.
+        chosen = [rdf.iloc[i] for i in all_sel.selection.rows]
+        if multi_book:
+            chosen = [best.iloc[i] for i in best_sel.selection.rows] + chosen
+        fc1, fc2 = st.columns([1, 3])
+        if fc1.button(f"⭐ Save {len(chosen)} pick{'s' if len(chosen) != 1 else ''} to My Picks",
+                      type="primary", disabled=not chosen):
+            new = []
+            for r in chosen:
+                info = lookup[r["Player"]]
+                over = r["Pick"] == "OVER"
+                dec = max(float(r["Sim P(over)"]) + float(r["Sim P(under)"]), 1e-9)
+                new.append({"player": r["Player"], "player_id": int(info["pid"]), "team": r["Team"],
+                            "opp": info["opp"], "stat": r["Stat"], "side": r["Pick"],
+                            "line": float(r["Line"]),
+                            "odds": float(r["Over odds"] if over else r["Under odds"]),
+                            "book": r["Book"], "value_score": round(float(r["Value Score"]), 1),
+                            "grade": r["Grade"], "game_date": game_date,
+                            "sim_prob": round(float(r["Sim P(over)" if over else "Sim P(under)"]) / dec, 3)})
+            added, dup = favs.add_picks(new)
+            st.toast(f"Saved {added} pick{'s' if added != 1 else ''} to My Picks"
+                     + (f" ({dup} already saved)" if dup else ""), icon="⭐")
+        fc2.caption("Tick the box at the left of any row (in either table) to pick it, then save. "
+                    "Saved picks are graded automatically once the game is in the box scores. "
+                    "See them and your record on the ⭐ My Picks tab.")
         with st.expander("How the Value Score works"):
             st.markdown("""
 - **50 = no edge.** The score is for the side in **Pick**. ≥75 = A, ≥65 = B, ≥58 = C, below that = Pass.
@@ -785,6 +817,118 @@ with tab_props:
 """)
     st.caption("Model output, not betting advice. Lines move on injury news the model can't see — "
                "always update the Rotations tab first.")
+
+# --------------------------------------------------------------------------- my picks tab
+
+def record_table(df: pd.DataFrame):
+    st.dataframe(df.drop(columns=["Wins", "Losses", "Pushes"]).style.format(
+        {"Win %": "{:.1%}", "Units": "{:+.2f}", "ROI": "{:+.1%}"}, na_rep="—"),
+        hide_index=True, width="stretch")
+
+
+with tab_picks:
+    newly = favs.grade_pending(ds.logs)
+    if newly:
+        st.toast(f"Graded {newly} pick{'s' if newly != 1 else ''} from the latest box scores", icon="✅")
+    pk = favs.load_picks()
+    st.subheader("⭐ My Picks")
+    if not len(pk):
+        st.info("No saved picks yet. On the 💰 Player Props tab, tick the box at the left of the "
+                "props you like and press **⭐ Save picks to My Picks**. They're graded automatically "
+                "once the game shows up in the box scores, and your record builds here.")
+    else:
+        today = pd.Timestamp(dt.date.today())
+        d = pd.to_datetime(pk["game_date"])
+        overall = favs.record(pk)
+        month = favs.record(pk[(d.dt.year == today.year) & (d.dt.month == today.month)])
+        year = favs.record(pk[d.dt.year == today.year])
+        n_pending = int((pk["result"] == "pending").sum())
+
+        def fmt_rec(r):
+            return (r["Record"], (f"{r['Win %']:.0%} · {r['Units']:+.2f} u" if r["Wins"] + r["Losses"]
+                                  else "no graded picks"))
+
+        c1, c2, c3, c4 = st.columns(4)
+        for col, label, r in ((c1, "All time", overall), (c2, today.strftime("%B %Y"), month),
+                              (c3, str(today.year), year)):
+            v, sub = fmt_rec(r)
+            col.metric(label, v, sub, delta_color="off")
+        c4.metric("Pending", n_pending, f"{len(pk)} saved in all", delta_color="off")
+        st.caption("Record is wins-losses(-pushes). Each pick counts as a 1-unit bet at the odds you "
+                   "saved: **Units** is profit in units and **ROI** is profit per unit risked. "
+                   "At -110 you need to win 52.4% to break even. Voided picks (player didn't play) "
+                   "don't count.")
+
+        graded = pk[pk["result"].isin(["win", "loss", "push"])].copy()
+        if len(graded):
+            graded["profit"] = graded.apply(favs.profit, axis=1)
+            graded = graded.sort_values(["game_date", "saved_at"])
+            graded["Units"] = graded["profit"].cumsum()
+            graded["Pick #"] = range(1, len(graded) + 1)
+            graded["Bet"] = (graded["player"] + " " + graded["stat"] + " " + graded["side"].str.lower()
+                             + " " + graded["line"].map("{:g}".format))
+            st.altair_chart(
+                alt.Chart(graded).mark_line(point=True).encode(
+                    x=alt.X("Pick #:Q", title="Graded picks, oldest first"),
+                    y=alt.Y("Units:Q", title="Running profit (units)"),
+                    tooltip=["game_date", "Bet", "result", alt.Tooltip("Units:Q", format="+.2f")])
+                + alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4], color="gray").encode(y="y"),
+                width="stretch")
+
+        r1, r2 = st.columns(2)
+        with r1:
+            st.markdown("**By month**")
+            record_table(favs.record(pk, "month"))
+        with r2:
+            st.markdown("**By year**")
+            record_table(favs.record(pk, "year"))
+        r3, r4 = st.columns(2)
+        with r3:
+            st.markdown("**By stat**")
+            record_table(favs.record(pk, "stat").rename(columns={"stat": "Stat"}))
+        with r4:
+            st.markdown("**By model grade**")
+            record_table(favs.record(pk, "grade").rename(columns={"grade": "Grade"}))
+
+        st.markdown("**All saved picks**")
+        st.caption("Results fill in automatically. To fix one by hand, change **Result** (a hand-set "
+                   "result is never overwritten). Tick **Delete** to remove a pick. Press **Save "
+                   "changes** when done.")
+        view = pk.sort_values(["game_date", "saved_at"], ascending=False).reset_index(drop=True)
+        view["Delete"] = False
+        edited = st.data_editor(
+            view[["Delete", "game_date", "player", "team", "opp", "stat", "side", "line", "odds", "book",
+                  "grade", "value_score", "sim_prob", "actual", "result", "note"]],
+            hide_index=True, width="stretch", key="fav_editor",
+            disabled=["game_date", "player", "team", "opp", "stat", "side", "line", "odds", "book",
+                      "grade", "value_score", "sim_prob", "actual"],
+            column_config={
+                "Delete": st.column_config.CheckboxColumn(width="small"),
+                "game_date": "Date", "player": "Player", "team": "Team", "opp": "Opp", "stat": "Stat",
+                "side": "Side", "line": st.column_config.NumberColumn("Line", format="%.1f"),
+                "odds": st.column_config.NumberColumn("Odds", format="%+d"), "book": "Book",
+                "grade": "Grade", "value_score": st.column_config.NumberColumn("Score", format="%.0f"),
+                "sim_prob": st.column_config.NumberColumn("Sim %", format="percent"),
+                "actual": st.column_config.NumberColumn("Actual", format="%g"),
+                "result": st.column_config.SelectboxColumn("Result", options=favs.RESULTS, required=True),
+                "note": st.column_config.TextColumn("Note"),
+            })
+        s1, s2 = st.columns([1, 3])
+        if s1.button("Save changes", key="fav_save"):
+            keep = view.copy()
+            changed = edited["result"] != view["result"]
+            keep.loc[changed, "graded_by"] = "manual"
+            keep["result"] = edited["result"]
+            keep["note"] = edited["note"].fillna("")
+            # Setting a pick back to pending hands it back to the auto-grader.
+            keep.loc[changed & (keep["result"] == "pending"), "graded_by"] = ""
+            keep = keep[~edited["Delete"].astype(bool)]
+            favs.save_picks(keep)
+            st.toast(f"Saved · {int(edited['Delete'].sum())} deleted", icon="💾")
+            st.rerun()
+        s2.download_button("Download picks (CSV)", pk.to_csv(index=False), "my_picks.csv", "text/csv")
+        st.caption(f"Picks are stored on this computer in `{favs.PICKS_PATH}`. Box scores through "
+                   f"{ds.logs_through or 'n/a'}; they refresh every hour.")
 
 # --------------------------------------------------------------------------- player deep dive
 
