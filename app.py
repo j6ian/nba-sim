@@ -86,9 +86,9 @@ def pct(x, d=1):
 # --------------------------------------------------------------------------- sidebar
 
 st.sidebar.title("🏀 NBA Matchup Sim")
-season = st.sidebar.text_input("Season", current_season())
-game_date = st.sidebar.date_input("Game date", dt.date.today(),
-                                   help="Used for rest days, back-to-backs and travel.")
+# Always the current season and today's slate (rest days, back-to-backs and travel use today).
+season = current_season()
+game_date = dt.date.today()
 with st.sidebar.expander("Model settings"):
     prior_games = st.slider("Last season counts as N games", 0, 60, 20,
                             help="Early in the season, current-season samples are tiny. Last "
@@ -159,8 +159,8 @@ def open_game(a: str, h: str):
     st.session_state.away_sel, st.session_state.home_sel = a, h
 
 
-away = st.sidebar.selectbox("Away team", abbrs, key="away_sel", format_func=fmt)
-home = st.sidebar.selectbox("Home team", abbrs, key="home_sel", format_func=fmt)
+# Games are opened from today's slate. On a day with no games, teams can be picked in the slate box.
+away, home = st.session_state.away_sel, st.session_state.home_sel
 st.sidebar.caption(f"Data: {ds.season} blended with {ds.prior_season} · built {ds.built_at}"
                    f" · games through {ds.logs_through or '?'}")
 
@@ -285,11 +285,13 @@ def show_credits():
                         f"once every 10 minutes) · {updated}{left}")
 
 
-day_label = "Today's games" if game_date == dt.date.today() else f"Games on {fmt(game_date, '%a, %b %-d')}"
+day_label = "Today's games"
 with st.expander(f"📅 {day_label} ({len(slate)})", expanded=True):
     if not slate:
-        st.caption(f"No games found for this date ({slate_source}). Change the game date in the "
-                   "sidebar, or pick teams there.")
+        st.caption(f"No games today ({slate_source}). Pick any two teams to simulate:")
+        p1, p2, _ = st.columns([1, 1, 2])
+        away = p1.selectbox("Away team", abbrs, key="away_sel", format_func=fmt)
+        home = p2.selectbox("Home team", abbrs, key="home_sel", format_func=fmt)
     if not st.session_state.odds_key:
         st.caption("Add your Odds API key in 💰 Player Props → Live sportsbook lines to get "
                    "spreads, totals and player props.")
