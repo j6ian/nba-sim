@@ -81,14 +81,16 @@ def _opp_of(matchup: str) -> str:
 def grade_one(logs: pd.DataFrame, pick) -> tuple[str, float | None]:
     """Grade one pick from game logs. Returns (result, actual stat) or ('pending', None)."""
     day = pd.Timestamp(pick["game_date"])
-    window = logs[(logs["GAME_DATE"] >= day) & (logs["GAME_DATE"] <= day + pd.Timedelta(days=1))]
+    window = logs[(logs["GAME_DATE"] >= day - pd.Timedelta(days=1)) & (logs["GAME_DATE"] <= day + pd.Timedelta(days=1))]
     if not len(window):
         return "pending", None
     team_games = window[(window["TEAM_ABBREVIATION"] == pick["team"])
                         & (window["MATCHUP"].map(_opp_of) == pick["opp"])]
     if not len(team_games):
         return "pending", None
-    game_id = team_games.sort_values("GAME_DATE")["GAME_ID"].iloc[0]
+    # Closest game to the saved date (saved just after midnight can be a day late).
+    team_games = team_games.assign(_gap=(team_games["GAME_DATE"] - day).abs())
+    game_id = team_games.sort_values("_gap")["GAME_ID"].iloc[0]
     me = team_games[team_games["GAME_ID"] == game_id]
     if pd.notna(pick.get("player_id")):
         me = me[me["PLAYER_ID"] == int(pick["player_id"])]
