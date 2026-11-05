@@ -209,5 +209,19 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
 
 
 def default_line(avg: float) -> float:
-    """Book-style default: nearest .5 to the average."""
+    """Book-style default: the .5 just above the whole number below the average."""
     return float(np.floor(avg) + 0.5)
+
+
+def estimate_line(ds: Dataset, pid, stat: str, fallback_avg: float | None = None) -> float:
+    """A stand-in line for when no sportsbook line has been fetched. Books set lines near a
+    player's typical recent game, so this leans on the median of his last 10 games, pulled a
+    little toward his season average so one hot streak doesn't set it. The blended season average
+    alone, which early in the season is mostly last season, can be far off: Tyrese Maxey's assists
+    blended to 6.2 a game while his line was 4.5."""
+    hist = log_values(ds, pid, PROP_STATS[stat])[:10]
+    if len(hist) >= 3:
+        med = float(np.median(hist))
+        est = med if fallback_avg is None else 0.65 * med + 0.35 * fallback_avg
+        return default_line(est)
+    return default_line(fallback_avg or 0.0)

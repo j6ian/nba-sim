@@ -24,7 +24,7 @@ from nbasim.detail import schedule_context, schedule_factor
 from nbasim.factors import NOT_AVAILABLE, REGISTRY, Weights
 from nbasim.model import expected_pace, minutes_table, player_efficiency, set_tracking, team_profile
 from nbasim.tracking import PLAY_TYPES, PT_LABELS, load_tracking
-from nbasim.props import PROP_STATS, default_line, evaluate_prop, log_values, prob_to_american
+from nbasim.props import PROP_STATS, estimate_line, evaluate_prop, log_values, prob_to_american
 from nbasim.lineups import on_off_usage, top_lineups
 from nbasim.sim import simulate
 from nbasim.timefmt import fmt
@@ -671,8 +671,9 @@ with tab_props:
     if use_live:
         st.markdown("Live lines from each book. Edit any line or price, or add your own rows with ➕.")
     else:
-        st.markdown("Enter your book's lines below (pre-filled with each player's average rounded to "
-                    "the nearest .5 — **replace with real lines**, or fetch live lines above).")
+        st.warning("**These are not sportsbook lines.** No live lines have been fetched for this game, "
+                   "so each line is an estimate built mostly from the player's last 10 games "
+                   "(Book = Estimate). Fetch live lines above, or type your book's real lines in.")
     key = f"props_{away}_{home}" + ("_live" if use_live else "")
     if use_live and key not in st.session_state:
         ll = live["lines"].dropna(subset=["Player"])
@@ -688,8 +689,9 @@ with tab_props:
                     avg = sum(r[p] for p in PROP_STATS[stat]) / max(r["GP"], 1)
                     if stat in ("3PM",) and avg < 0.8:
                         continue
-                    rows.append({"Player": prof.names[i], "Stat": stat, "Line": default_line(avg),
-                                 "Over odds": -110, "Under odds": -110, "Book": "Manual"})
+                    rows.append({"Player": prof.names[i], "Stat": stat,
+                                 "Line": estimate_line(ds, prof.ids[i], stat, avg),
+                                 "Over odds": -110, "Under odds": -110, "Book": "Estimate"})
         st.session_state[key] = pd.DataFrame(rows)
     lines = st.data_editor(
         st.session_state[key], key=f"{key}_editor", num_rows="dynamic", hide_index=True, width="stretch",
@@ -940,7 +942,9 @@ with tab_player:
     stat = a.selectbox("Stat", list(PROP_STATS), key="dd_stat")
     hist_vals = log_values(ds, pid, PROP_STATS[stat])
     savg = sum(r[p] for p in PROP_STATS[stat]) / max(r["GP"], 1)
-    line = a.number_input("Line", value=default_line(savg), step=0.5, key=f"dd_line_{pid}_{stat}")
+    line = a.number_input("Line", value=estimate_line(ds, pid, stat, savg), step=0.5,
+                          key=f"dd_line_{pid}_{stat}",
+                          help="Pre-filled with an estimate from his last 10 games. Type the real line.")
     oo = a.number_input("Over odds", value=-110, step=5, key="dd_oo")
     uo = a.number_input("Under odds", value=-110, step=5, key="dd_uo")
     vals = sum(res.players[info["team"]][p][:, info["idx"]] for p in PROP_STATS[stat])
