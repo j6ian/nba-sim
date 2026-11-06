@@ -2,7 +2,8 @@
 
 Value Score (0-100, for the better side):
   50 = no edge. Built from four parts, each squashed so no single input dominates:
-    - Sim edge (55%):     sim probability minus the book's no-vig implied probability
+    - Sim edge (55%):     model probability minus the book's no-vig implied probability, where
+                          the model probability blends the sim with the book (MARKET_WEIGHT)
     - Cushion (25%):      (minutes-adjusted average - line) / game-to-game SD
     - Hit rate (20%):     share of the last 10 games over the line (shown for the picked side)
   then pulled toward 50 when the minutes projection is shaky (high minutes SD).
@@ -33,6 +34,22 @@ OPP_ALLOWED = {"PTS": "OPP_PTS_PG", "REB": "OPP_REB_PG", "AST": "OPP_AST_PG", "3
 # Probabilities are shrunk toward even in log-odds; 0.8 is the best single factor on that
 # backtest (scripts/backtest_props.py), rounded toward caution.
 PROB_SHRINK = 0.8
+
+# Market blend: the model's probability is the sim's probability blended with the book's no-vig
+# probability in log-odds, with this weight on the book. Sportsbook prices already hold
+# information the sim can't see (late injury news, sharp money, role changes), and books are
+# hard to beat, so a sim that disagrees a lot with the price is more often wrong than right.
+# 0.35 keeps the sim in charge while trimming its biggest disagreements; edges shrink by about
+# a third, so fewer props grade A or B. Adjustable in the sidebar (Factor weights -> Props).
+MARKET_WEIGHT = 0.35
+
+
+def blend_with_market(p_model, p_book, weight: float = MARKET_WEIGHT):
+    """Blend two probabilities in log-odds space: weight 0 = model only, 1 = book only."""
+    pm = np.clip(np.asarray(p_model, dtype=float), 1e-4, 1 - 1e-4)
+    pb = np.clip(np.asarray(p_book, dtype=float), 1e-4, 1 - 1e-4)
+    z = (1 - weight) * np.log(pm / (1 - pm)) + weight * np.log(pb / (1 - pb))
+    return 1 / (1 + np.exp(-z))
 
 
 def calibrate_prob(p, shrink: float = PROB_SHRINK):
@@ -132,9 +149,11 @@ def opp_rank(ds: Dataset, opp_abbr: str, stat: str, pid=None) -> tuple[float, in
 def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float,
                   over_odds: float = -110, under_odds: float = -110, proj_min: float | None = None,
                   min_sd: float | None = None, opp_abbr: str | None = None,
-                  sim_min: np.ndarray | None = None) -> dict:
+                  sim_min: np.ndarray | None = None, market_weight: float = MARKET_WEIGHT) -> dict:
     """sim_min: the player's simulated minutes per game. When given, only games he played count,
-    the same way books void a prop when the player doesn't play."""
+    the same way books void a prop when the player doesn't play.
+    market_weight: how much the book's no-vig price counts in the model probability (0 = sim
+    only). Pass 0 for lines that aren't real sportsbook prices, like estimates."""
     parts = PROP_STATS[stat]
     if sim_min is not None and (sim_min > 0).any():
         sim_vals = sim_vals[sim_min > 0]
@@ -149,10 +168,13 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
     sim_under = float((sim_vals < line).mean())
     p_push = 1 - sim_over - sim_under
     dec = max(sim_over + sim_under, 1e-9)
-    p_over = float(calibrate_prob(sim_over / dec)) * dec
-    p_under = dec - p_over
+    sim_p_over = float(calibrate_prob(sim_over / dec)) * dec
+    sim_p_under = dec - sim_p_over
     io, iu = american_to_prob(over_odds), american_to_prob(under_odds)
     nv_over = io / (io + iu)
+    # Model probability: the calibrated sim blended with the book's no-vig price (no-push basis).
+    p_over = float(blend_with_market(sim_p_over / dec, nv_over, market_weight)) * dec
+    p_under = dec - p_over
     # Compare on a no-push basis so integer lines are fair.
     decided = max(p_over + p_under, 1e-9)
     edge_over = p_over / decided - nv_over
@@ -191,7 +213,8 @@ def evaluate_prop(ds: Dataset, sim_vals: np.ndarray, pid, stat: str, line: float
         "L10 over hit": hit10,
         "L10": " ".join(f"{v:g}" for v in l10),
         "Sim mean": float(sim_vals.mean()), "Sim median": float(np.median(sim_vals)),
-        "Sim P(over)": p_over, "Sim P(under)": p_under, "P(push)": p_push,
+        "Sim P(over)": sim_p_over, "Sim P(under)": sim_p_under, "P(push)": p_push,
+        "Model P(over)": p_over, "Model P(under)": p_under,
         "Raw sim P(over)": sim_over,
         "Book P(over)": nv_over, "Edge over": edge_over, "Edge under": edge_under,
         "EV over": ev_over, "EV under": ev_under,

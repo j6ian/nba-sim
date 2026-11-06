@@ -45,6 +45,8 @@ class Weights:
     clutch: float = 1.0
     # Schedule
     rest_travel: float = 1.0
+    # Props
+    market_weight: float = 0.35
 
     def as_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -169,6 +171,14 @@ REGISTRY = [
      "make probability and raise turnovers slightly.",
      "-",
      "1.0 = research-sized effects (back-to-back about -1.5 pts per 100). Not measurable per player here."),
+    ("market_weight", "Props", "Market blend (book's share of prop odds)", 1.0,
+     "The Odds API: each book's over / under prices, with the vig removed",
+     "A prop's model probability is the sim's probability blended with the book's no-vig "
+     "probability in log-odds; this is the book's share. Edge, EV, fair odds and the Value Score "
+     "use the blend. Estimated lines (no real price) skip it.",
+     "-",
+     "0.35: books are hard to beat, so big disagreements with the price are more often the sim's "
+     "error. Keeps the sim in charge while trimming its edges by about a third. 0 = sim only."),
 ]
 
 NOT_AVAILABLE = [
