@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore")
 from nbasim import data as nbadata  # noqa: E402
 from nbasim import injuries  # noqa: E402
 from nbasim import odds as oddsapi  # noqa: E402
+from nbasim import reportcard  # noqa: E402
 from nbasim import schedule  # noqa: E402
 from nbasim.detail import schedule_context, schedule_factor  # noqa: E402
 from nbasim.factors import Weights  # noqa: E402
@@ -187,7 +188,8 @@ def run_game(ds, tr, weights, g, names, game_date, inj_report, lines, n_sims):
             if r.get("One-sided", False):
                 flags.append("one-sided line")
             odds = r["Over odds"] if ev["Pick"] == "OVER" else r["Under odds"]
-            rows.append({"Game": game["Game"], "Player": nm, "Team": info["team"], "Stat": r["Stat"],
+            rows.append({"Game": game["Game"], "Player": nm, "Team": info["team"], "Opp": info["opp"],
+                         "Player ID": int(info["pid"]), "Stat": r["Stat"],
                          "Pick": ev["Pick"], "Line": float(r["Line"]), "Odds": float(odds),
                          "Book": r["Book"], "Value Score": ev["Value Score"], "Grade": ev["Grade"],
                          "Sim mean": ev["Sim mean"], "Sim P(over)": ev["Sim P(over)"],
@@ -198,6 +200,16 @@ def run_game(ds, tr, weights, g, names, game_date, inj_report, lines, n_sims):
                          "Flags": "; ".join(flags)})
     game["unmatched"] = sorted(set(unmatched))
     return game, rows
+
+
+def candidate_row(r, game_date, source: str) -> dict:
+    """A scored prop (a run_game row) in the report card's candidate format."""
+    p_over = float(r["Sim P(over)"])
+    return {"game_date": str(game_date), "player": r["Player"], "player_id": r.get("Player ID"),
+            "team": r["Team"], "opp": r["Opp"], "stat": r["Stat"], "side": r["Pick"],
+            "line": float(r["Line"]), "odds": float(r["Odds"]), "book": r["Book"],
+            "value_score": round(float(r["Value Score"]), 1), "grade": r["Grade"],
+            "sim_prob": round(p_over if r["Pick"] == "OVER" else 1 - p_over, 3), "source": source}
 
 
 # --------------------------------------------------------------------------- report
@@ -395,6 +407,12 @@ def main():
         allp.to_csv(f"{stem}_all_lines.csv", index=False)
         best = allp.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
     best.to_csv(f"{stem}.csv", index=False)
+    # Feed the app's daily report card (only games that haven't tipped off yet).
+    not_started = {f"{g['away']} @ {g['home']}" for g in slate if not reportcard.game_started(g)}
+    saved = reportcard.record_candidates(
+        [candidate_row(r, game_date, "run_slate") for _, r in best.iterrows() if r["Game"] in not_started])
+    if saved:
+        log(f"Saved {saved} props as report card candidates for {game_date}.")
     meta = {"sims": args.sims, "generated": fmt(dt.datetime.now(), "%b %-d %-I:%M %p"),
             "markets": markets, "credits_used": used,
             "credits_left": (oddsapi.latest_quota() or {}).get("remaining"), "warnings": warnings_,
