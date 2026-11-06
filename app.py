@@ -720,7 +720,8 @@ with tab_props:
         uo_ = -110 if pd.isna(uo_) else uo_
         ev = evaluate_prop(ds, vals, info["pid"], row["Stat"], float(row["Line"]), oo_, uo_,
                            proj_min=info["proj"], min_sd=info["sd"], opp_abbr=info["opp"],
-                           sim_min=res.players[info["team"]]["MIN"][:, info["idx"]])
+                           sim_min=res.players[info["team"]]["MIN"][:, info["idx"]],
+                           market_weight=0.0 if row.get("Book") == "Estimate" else weights.market_weight)
         results.append({"Player": row["Player"], "Team": info["team"], "Stat": row["Stat"],
                         "Book": row.get("Book") or "Manual", "Over odds": oo_, "Under odds": uo_,
                         "Proj Min": info["proj"], **ev})
@@ -736,11 +737,11 @@ with tab_props:
             best = best.assign(**{"Odds": np.where(best["Pick"] == "OVER", best["Over odds"], best["Under odds"])})
             best = best.reset_index(drop=True)
             best_sel = st.dataframe(best[[c for c in ["Player", "Team", "Stat", "Pick", "Line", "Odds", "Book",
-                                           "Value Score", "Grade", "Sim mean", "Sim P(over)",
+                                           "Value Score", "Grade", "Sim mean", "Sim P(over)", "Model P(over)",
                                            "Book P(over)", "L10 hit", "Opp vs pos", "Opp rank"]
                                if c in best]]
                          .style.format({"Line": "{:.1f}", "Odds": "{:+.0f}", "Value Score": "{:.0f}",
-                                        "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}",
+                                        "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}", "Model P(over)": "{:.0%}",
                                         "Book P(over)": "{:.0%}", "L10 hit": "{:.0%}",
                                         "Opp rank": "{:.0f}"}, na_rep="—"),
                          hide_index=True, width="stretch", height=min(42 + 35 * len(best), 600),
@@ -755,7 +756,7 @@ with tab_props:
             st.subheader("Every line, every book")
         show = ["Player", "Team", "Stat", "Book", "Line", "Over odds", "Under odds", "Pick",
                 "Value Score", "Grade", "Sim mean",
-                "Sim P(over)", "Book P(over)", "Edge over", "EV over", "EV under", "Season avg",
+                "Sim P(over)", "Model P(over)", "Book P(over)", "Edge over", "EV over", "EV under", "Season avg",
                 "Min-adj avg", "L5 avg", "L10 avg", "L10 hit", "Season hit", "L10", "Proj Min",
                 "Opp vs pos", "Opp allows", "Opp rank", "Opp vs avg", "Fair over odds"]
         show = [c for c in show if c in rdf]
@@ -773,7 +774,7 @@ with tab_props:
         all_sel = st.dataframe(
             rdf[show].style.format({
                 "Line": "{:.1f}", "Over odds": "{:+.0f}", "Under odds": "{:+.0f}",
-                "Value Score": "{:.0f}", "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}",
+                "Value Score": "{:.0f}", "Sim mean": "{:.1f}", "Sim P(over)": "{:.0%}", "Model P(over)": "{:.0%}",
                 "Book P(over)": "{:.0%}", "Edge over": "{:+.1%}", "EV over": "{:+.2f}", "EV under": "{:+.2f}",
                 "Season avg": "{:.1f}", "Min-adj avg": "{:.1f}", "L5 avg": "{:.1f}", "L10 avg": "{:.1f}",
                 "L10 hit": "{:.0%}", "Season hit": "{:.0%}", "Proj Min": "{:.1f}", "Opp rank": "{:.0f}",
@@ -832,7 +833,7 @@ with tab_props:
         with st.expander("How the Value Score works"):
             st.markdown("""
 - **50 = no edge.** The score is for the side in **Pick**. ≥75 = A, ≥65 = B, ≥58 = C, below that = Pass.
-- **Sim edge (55%)**: simulated probability of the pick minus the book's no-vig implied probability.
+- **Sim edge (55%)**: the model's probability of the pick minus the book's no-vig implied probability. The model's probability (**Model P(over)**) is the sim's (**Sim P(over)**) blended with the book's price, with the book counting 35% by default (**Market blend** under Factor weights → Props in the sidebar; 0 = sim only). Books are hard to beat, so this trims the sim's biggest disagreements. Estimated lines skip the blend. Edge, EV and fair odds all use the blend.
 - **Cushion (25%)**: (minutes-adjusted average − line) ÷ the player's game-to-game SD.
 - **Hit rate (20%)**: how often the last 10 games cleared the line.
 - **L10 hit** and **Season hit** are for the side in **Pick**: for an UNDER, how often he stayed under. A game exactly on the line (a push) isn't a hit. **L10** lists his last 10 games, newest first.
@@ -1244,10 +1245,12 @@ with tab_player:
     uo = a.number_input("Under odds", value=-110, step=5, key="dd_uo")
     vals = sum(res.players[info["team"]][p][:, info["idx"]] for p in PROP_STATS[stat])
     ev = evaluate_prop(ds, vals, pid, stat, line, oo, uo, info["proj"], info["sd"], info["opp"],
-                       sim_min=res.players[info["team"]]["MIN"][:, info["idx"]])
+                       sim_min=res.players[info["team"]]["MIN"][:, info["idx"]],
+                       market_weight=weights.market_weight)
     with a:
         st.metric("Value Score", f"{ev['Value Score']:.0f} ({ev['Grade']})", ev["Pick"])
-        st.write(f"Sim P(over): **{pct(ev['Sim P(over)'])}** · book (no-vig) {pct(ev['Book P(over)'])}")
+        st.write(f"Sim P(over): **{pct(ev['Sim P(over)'])}** · blended with the book "
+                 f"{pct(ev['Model P(over)'])} · book (no-vig) {pct(ev['Book P(over)'])}")
         st.write(f"Season {ev['Season avg']:.1f} · L10 {ev['L10 avg']:.1f} · min-adj {ev['Min-adj avg']:.1f}")
         st.write(f"L10 hit rate ({ev['Pick'].lower()}): {pct(ev['L10 hit'], 0)} · last 10: {ev['L10']}")
         if "Opp rank" in ev:

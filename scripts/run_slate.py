@@ -177,7 +177,8 @@ def run_game(ds, tr, weights, g, names, game_date, inj_report, lines, n_sims):
             vals = sum(s[p][:, info["idx"]] for p in PROP_STATS[r["Stat"]])
             ev = evaluate_prop(ds, vals, info["pid"], r["Stat"], float(r["Line"]),
                                r["Over odds"], r["Under odds"], proj_min=info["proj"],
-                               min_sd=info["sd"], opp_abbr=info["opp"], sim_min=s["MIN"][:, info["idx"]])
+                               min_sd=info["sd"], opp_abbr=info["opp"], sim_min=s["MIN"][:, info["idx"]],
+                               market_weight=weights.market_weight)
             flags = []
             if info["injury"] in ("Doubtful", "Questionable", "Day-To-Day", "Probable"):
                 flags.append(f"he is {info['injury'].lower()}")
@@ -193,6 +194,7 @@ def run_game(ds, tr, weights, g, names, game_date, inj_report, lines, n_sims):
                          "Pick": ev["Pick"], "Line": float(r["Line"]), "Odds": float(odds),
                          "Book": r["Book"], "Value Score": ev["Value Score"], "Grade": ev["Grade"],
                          "Sim mean": ev["Sim mean"], "Sim P(over)": ev["Sim P(over)"],
+                         "Model P(over)": ev["Model P(over)"],
                          "Book P(over)": ev["Book P(over)"],
                          "EV": ev["EV over"] if ev["Pick"] == "OVER" else ev["EV under"],
                          "L10 hit": ev["L10 hit"], "Proj Min": info["proj"],
