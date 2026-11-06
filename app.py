@@ -31,6 +31,7 @@ from nbasim.timefmt import fmt
 from nbasim.wowy import player_split_games, split_summary, teammate_table
 from nbasim import hitrates
 from nbasim import picks as favs
+from nbasim import reportcard as rc
 
 st.set_page_config(page_title="NBA Matchup Simulator", page_icon="🏀", layout="wide")
 
@@ -361,9 +362,9 @@ if home == away:
 T = ds.teams.set_index("TEAM_ABBREVIATION")
 st.title(f"{names[away]} @ {names[home]}")
 
-(tab_sim, tab_props, tab_picks, tab_player, tab_hits, tab_wowy, tab_match, tab_rot, tab_watch,
+(tab_sim, tab_props, tab_picks, tab_card, tab_player, tab_hits, tab_wowy, tab_match, tab_rot, tab_watch,
  tab_model) = st.tabs(
-    ["🎲 Game Sim", "💰 Player Props", "⭐ My Picks", "🔍 Player Deep Dive", "🎯 Hit Rates",
+    ["🎲 Game Sim", "💰 Player Props", "⭐ My Picks", "📋 Report Card", "🔍 Player Deep Dive", "🎯 Hit Rates",
      "🔀 With / Without",
      "📊 Matchup", "⏱ Rotations", "📺 Watch a Game", "🧠 Model & Data"])
 
@@ -781,6 +782,25 @@ with tab_props:
             hide_index=True, width="stretch", height=min(42 + 35 * len(rdf), 700),
             on_select="rerun", selection_mode="multi-row", key=f"fav_all_{key}")
 
+        # The model's report card: the best book and side for each prop, saved while the game
+        # hasn't started. Only real sportsbook lines count (rc drops estimates and manual rows).
+        this_game = next((g for g in slate if (g["away"], g["home"]) == (away, home)), None)
+        if use_live and this_game is not None and not rc.game_started(this_game):
+            top = rdf.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
+            sig = hashlib.md5(pd.util.hash_pandas_object(
+                top[["Player", "Stat", "Pick", "Line", "Book", "Value Score"]], index=False).values).hexdigest()
+            if st.session_state.get(f"rc_sig_{key}") != sig:
+                rc.record_candidates([{
+                    "game_date": game_date, "player": r["Player"], "player_id": int(lookup[r["Player"]]["pid"]),
+                    "team": r["Team"], "opp": lookup[r["Player"]]["opp"], "stat": r["Stat"], "side": r["Pick"],
+                    "line": float(r["Line"]),
+                    "odds": float(r["Over odds"] if r["Pick"] == "OVER" else r["Under odds"]),
+                    "book": r["Book"], "value_score": round(float(r["Value Score"]), 1), "grade": r["Grade"],
+                    "sim_prob": round(float(r["Sim P(over)"] if r["Pick"] == "OVER" else r["Sim P(under)"])
+                                      / max(float(r["Sim P(over)"]) + float(r["Sim P(under)"]), 1e-9), 3),
+                    "source": "app"} for _, r in top.iterrows()])
+                st.session_state[f"rc_sig_{key}"] = sig
+
         # Favorites: tick rows in either table, then save them to the My Picks tab.
         chosen = [rdf.iloc[i] for i in all_sel.selection.rows]
         if multi_book:
@@ -822,6 +842,41 @@ with tab_props:
 
 # --------------------------------------------------------------------------- my picks tab
 
+def profit_chart(pk: pd.DataFrame):
+    """Running units won over graded picks, oldest first."""
+    graded = pk[pk["result"].isin(["win", "loss", "push"])].copy()
+    if not len(graded):
+        return
+    graded["profit"] = graded.apply(favs.profit, axis=1)
+    graded = graded.sort_values(["game_date", "saved_at"])
+    graded["Units"] = graded["profit"].cumsum()
+    graded["Pick #"] = range(1, len(graded) + 1)
+    graded["Bet"] = (graded["player"] + " " + graded["stat"] + " " + graded["side"].str.lower()
+                     + " " + graded["line"].map("{:g}".format))
+    st.altair_chart(
+        alt.Chart(graded).mark_line(point=True).encode(
+            x=alt.X("Pick #:Q", title="Graded picks, oldest first"),
+            y=alt.Y("Units:Q", title="Running profit (units)"),
+            tooltip=["game_date", "Bet", "result", alt.Tooltip("Units:Q", format="+.2f")])
+        + alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4], color="gray").encode(y="y"),
+        width="stretch")
+
+
+def record_metrics(pk: pd.DataFrame, extra=None):
+    """All time / this month / this year records as metric tiles (plus one optional extra tile)."""
+    today = pd.Timestamp(dt.date.today())
+    d = pd.to_datetime(pk["game_date"])
+    cols = st.columns(4)
+    for col, label, r in ((cols[0], "All time", favs.record(pk)),
+                          (cols[1], today.strftime("%B %Y"),
+                           favs.record(pk[(d.dt.year == today.year) & (d.dt.month == today.month)])),
+                          (cols[2], str(today.year), favs.record(pk[d.dt.year == today.year]))):
+        sub = (f"{r['Win %']:.0%} · {r['Units']:+.2f} u" if r["Wins"] + r["Losses"] else "no graded picks")
+        col.metric(label, r["Record"], sub, delta_color="off")
+    if extra:
+        cols[3].metric(*extra, delta_color="off")
+
+
 def record_table(df: pd.DataFrame):
     st.dataframe(df.drop(columns=["Wins", "Losses", "Pushes"]).style.format(
         {"Win %": "{:.1%}", "Units": "{:+.2f}", "ROI": "{:+.1%}"}, na_rep="—"),
@@ -861,21 +916,7 @@ with tab_picks:
                    "At -110 you need to win 52.4% to break even. Voided picks (player didn't play) "
                    "don't count.")
 
-        graded = pk[pk["result"].isin(["win", "loss", "push"])].copy()
-        if len(graded):
-            graded["profit"] = graded.apply(favs.profit, axis=1)
-            graded = graded.sort_values(["game_date", "saved_at"])
-            graded["Units"] = graded["profit"].cumsum()
-            graded["Pick #"] = range(1, len(graded) + 1)
-            graded["Bet"] = (graded["player"] + " " + graded["stat"] + " " + graded["side"].str.lower()
-                             + " " + graded["line"].map("{:g}".format))
-            st.altair_chart(
-                alt.Chart(graded).mark_line(point=True).encode(
-                    x=alt.X("Pick #:Q", title="Graded picks, oldest first"),
-                    y=alt.Y("Units:Q", title="Running profit (units)"),
-                    tooltip=["game_date", "Bet", "result", alt.Tooltip("Units:Q", format="+.2f")])
-                + alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4], color="gray").encode(y="y"),
-                width="stretch")
+        profit_chart(pk)
 
         r1, r2 = st.columns(2)
         with r1:
@@ -931,6 +972,111 @@ with tab_picks:
         s2.download_button("Download picks (CSV)", pk.to_csv(index=False), "my_picks.csv", "text/csv")
         st.caption(f"Picks are stored on this computer in `{favs.PICKS_PATH}`. Box scores through "
                    f"{ds.logs_through or 'n/a'}; they refresh every hour.")
+
+# --------------------------------------------------------------------------- report card tab
+
+def score_whole_slate() -> tuple[int, list[str]]:
+    """Simulate every game on today's slate that has props loaded and hasn't started, and save
+    each game's best props as report card candidates. Uses default rotations plus the injury
+    report, like scripts/run_slate.py."""
+    from scripts.run_slate import candidate_row, run_game  # imported here: only this button needs it
+    saved, notes = 0, []
+    todo = [g for g in slate if not rc.game_started(g)]
+    bar = st.progress(0.0, text="Scoring the slate...")
+    for i, g in enumerate(todo):
+        a, h = g["away"], g["home"]
+        bar.progress((i + 1) / len(todo), text=f"Simulating {a} @ {h} ({i + 1}/{len(todo)})")
+        sp = st.session_state.slate_props.get(slate_key(a, h))
+        if sp is None:
+            notes.append(f"{a} @ {h}: no props loaded")
+            continue
+        _, rows = run_game(ds, tr, weights, g, names, game_date, inj_report if use_injuries else None,
+                           sp["raw"], min(n_sims, 3000))
+        saved += rc.record_candidates([candidate_row(r, game_date, "app_slate") for r in rows])
+    bar.empty()
+    return saved, notes
+
+
+with tab_card:
+    locked, newly = rc.update(ds.logs, dt.date.today())
+    if locked or newly:
+        st.toast(f"Report card: locked {locked} pick{'s' if locked != 1 else ''}, graded {newly}", icon="📋")
+    st.subheader("📋 Model report card")
+    st.caption(f"Each day the model's own top {rc.TOP_N} props (highest Value Score across every game "
+               "it scored before tip-off) are locked in and graded from the box scores, so you can see "
+               "how the model itself is doing. Only real sportsbook lines count, never estimates. "
+               "Your hand-picked bets are on ⭐ My Picks.")
+
+    # Today's card, still open until the day ends.
+    cands = rc.load_candidates()
+    today_s = str(game_date)
+    tc = cands[cands["game_date"] == today_s]
+    teams_scored = set(tc["team"])
+    n_scored = sum(1 for g in slate if g["away"] in teams_scored or g["home"] in teams_scored)
+    st.markdown(f"**Today's card so far** · {n_scored} of {len(slate)} games scored")
+    if len(tc):
+        top_today = rc.top_picks(tc)
+        st.dataframe(top_today.assign(Bet=top_today["player"] + " " + top_today["side"].str.lower() + " "
+                                      + top_today["line"].map("{:g}".format) + " " + top_today["stat"])[
+            ["Bet", "team", "opp", "odds", "book", "grade", "value_score", "sim_prob", "scored_at"]],
+            hide_index=True, width="stretch", column_config={
+                "team": "Team", "opp": "Opp", "odds": st.column_config.NumberColumn("Odds", format="%+d"),
+                "book": "Book", "grade": "Grade",
+                "value_score": st.column_config.NumberColumn("Score", format="%.0f"),
+                "sim_prob": st.column_config.NumberColumn("Sim %", format="percent"),
+                "scored_at": "Scored at"})
+    else:
+        st.caption("Nothing scored yet today.")
+    loaded = sum(slate_key(g["away"], g["home"]) in st.session_state.slate_props for g in slate)
+    b1, b2 = st.columns([1, 3])
+    if b1.button("🧮 Score every game now", disabled=not loaded, width="stretch"):
+        n, notes = score_whole_slate()
+        st.toast(f"Scored {n} props for today's card", icon="🧮")
+        if notes:
+            st.caption("Skipped: " + "; ".join(notes))
+        st.rerun()
+    b2.caption("The card picks from every game the model has scored today. A game is scored when you "
+               "open it on 💰 Player Props with live lines, or all at once with this button after "
+               "**Pull props for all games** at the top (no extra credits). Rescoring before tip-off "
+               "updates the numbers; nothing changes once a game starts. Today's card locks "
+               "tomorrow." if loaded else
+               "Press **Pull props for all games** at the top first, then this button scores every "
+               "game for today's card without spending more credits. Opening a game on 💰 Player Props "
+               "with live lines scores it too.")
+
+    st.divider()
+    card = rc.load_card()
+    if not len(card):
+        st.info("No locked days yet. The first card locks the day after the model scores a game "
+                "with live lines.")
+    else:
+        record_metrics(card, ("Pending", int((card["result"] == "pending").sum()),
+                              f"{card['game_date'].nunique()} days locked"))
+        st.caption("Each pick is a 1-unit bet at the odds when it was scored. Record is "
+                   "wins-losses(-pushes); at -110 you need 52.4% to break even. Voided picks "
+                   "(player didn't play) don't count.")
+        profit_chart(card)
+        st.markdown("**Daily cards**")
+        st.dataframe(rc.daily_cards(card), hide_index=True, width="stretch", column_config={
+            "Units": st.column_config.NumberColumn(format="%+.2f")})
+        r1, r2 = st.columns(2)
+        with r1:
+            st.markdown("**By month**")
+            record_table(favs.record(card, "month"))
+        with r2:
+            st.markdown("**By year**")
+            record_table(favs.record(card, "year"))
+        r3, r4 = st.columns(2)
+        with r3:
+            st.markdown("**By stat**")
+            record_table(favs.record(card, "stat").rename(columns={"stat": "Stat"}))
+        with r4:
+            st.markdown("**Over vs under**")
+            record_table(favs.record(card, "side").rename(columns={"side": "Side"}))
+        st.download_button("Download report card (CSV)", card.to_csv(index=False), "report_card.csv",
+                           "text/csv")
+        st.caption(f"Stored on this computer in `{rc.CARD_PATH}` (candidates in `{rc.CAND_PATH}`). "
+                   f"Box scores through {ds.logs_through or 'n/a'}; they refresh every hour.")
 
 # --------------------------------------------------------------------------- player deep dive
 

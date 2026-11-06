@@ -26,6 +26,14 @@ event list instead.
 - **Player Props**: enter lines and odds. For each prop you get sim P(over), the book's no-vig
   probability, the edge, EV, season / L5 / L10 averages, hit rates, opponent rank, and a
   **Value Score** (0-100, with 50 meaning no edge) and grade for the better side.
+- **My Picks**: tick props you like on Player Props and save them. They're graded from the box
+  scores automatically, with your record all time, by month, by year, by stat and by grade.
+- **Report Card**: the model's own top 3 props each day (highest Value Score across every game it
+  scored before tip-off, real sportsbook lines only), locked in once the day ends and graded the
+  same way, with daily cards, records by month / year / stat and over vs under, and running
+  profit. Games are scored when opened on Player Props with live lines, all at once with
+  **Score every game now** (after **Pull props for all games**), or by `scripts/run_slate.py`.
+  Stored in `data/report_card.csv` (candidates in `data/model_candidates.csv`).
 - **Player Deep Dive**: TS%, eFG%, usage, shot diet vs league, FG% by zone vs what tonight's
   opponent allows, last-20 game log against the line, simulated distribution, and minutes trend.
   **Lineup context** shows his simulated usage with vs without each teammate on the floor, next
