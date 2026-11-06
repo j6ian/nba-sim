@@ -790,16 +790,19 @@ with tab_props:
             sig = hashlib.md5(pd.util.hash_pandas_object(
                 top[["Player", "Stat", "Pick", "Line", "Book", "Value Score"]], index=False).values).hexdigest()
             if st.session_state.get(f"rc_sig_{key}") != sig:
-                rc.record_candidates([{
-                    "game_date": game_date, "player": r["Player"], "player_id": int(lookup[r["Player"]]["pid"]),
-                    "team": r["Team"], "opp": lookup[r["Player"]]["opp"], "stat": r["Stat"], "side": r["Pick"],
-                    "line": float(r["Line"]),
-                    "odds": float(r["Over odds"] if r["Pick"] == "OVER" else r["Under odds"]),
-                    "book": r["Book"], "value_score": round(float(r["Value Score"]), 1), "grade": r["Grade"],
-                    "sim_prob": round(float(r["Sim P(over)"] if r["Pick"] == "OVER" else r["Sim P(under)"])
-                                      / max(float(r["Sim P(over)"]) + float(r["Sim P(under)"]), 1e-9), 3),
-                    "source": "app"} for _, r in top.iterrows()])
-                st.session_state[f"rc_sig_{key}"] = sig
+                try:
+                    rc.record_candidates([{
+                        "game_date": game_date, "player": r["Player"], "player_id": int(lookup[r["Player"]]["pid"]),
+                        "team": r["Team"], "opp": lookup[r["Player"]]["opp"], "stat": r["Stat"], "side": r["Pick"],
+                        "line": float(r["Line"]),
+                        "odds": float(r["Over odds"] if r["Pick"] == "OVER" else r["Under odds"]),
+                        "book": r["Book"], "value_score": round(float(r["Value Score"]), 1), "grade": r["Grade"],
+                        "sim_prob": round(float(r["Sim P(over)"] if r["Pick"] == "OVER" else r["Sim P(under)"])
+                                          / max(float(r["Sim P(over)"]) + float(r["Sim P(under)"]), 1e-9), 3),
+                        "source": "app"} for _, r in top.iterrows()])
+                    st.session_state[f"rc_sig_{key}"] = sig
+                except Exception as exc:  # never let the report card break the Props tab
+                    st.caption(f"Couldn't save these props to the report card: {exc}")
 
         # Favorites: tick rows in either table, then save them to the My Picks tab.
         chosen = [rdf.iloc[i] for i in all_sel.selection.rows]
