@@ -167,6 +167,9 @@ def fetch_props(key: str, event_id: str, stats: list[str], books: list[str],
         "dateFormat": "iso"})
     with open(path, "w") as fh:
         json.dump({"data": data, "quota": quota, "fetched": time.time()}, fh)
+    # Keep every pulled line for the line log (graded later, closing line value). Never raises.
+    from .linelog import log_pull
+    log_pull(data)
     return data, {**quota, "cached": False}
 
 

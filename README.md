@@ -34,6 +34,12 @@ event list instead.
   profit. Games are scored when opened on Player Props with live lines, all at once with
   **Score every game now** (after **Pull props for all games**), or by `scripts/run_slate.py`.
   Stored in `data/report_card.csv` (candidates in `data/model_candidates.csv`).
+  Below the card, **Every scored line** keeps every sportsbook line the model scored before
+  tip-off (`data/scored_lines.csv`) and grades it after the game: record, units, ROI, average edge
+  and closing line value by grade, stat, side, month and book, plus calibration of the model's
+  probability. Every props pull is also saved with its prices (`data/line_log.csv`); the last
+  pull before tip-off is the closing line. **Backtest** re-simulates played games (no credits)
+  and reports bias and P(over) calibration, the same as `scripts/backtest_props.py`.
 - **Player Deep Dive**: TS%, eFG%, usage, shot diet vs league, FG% by zone vs what tonight's
   opponent allows, last-20 game log against the line, simulated distribution, and minutes trend.
   **Lineup context** shows his simulated usage with vs without each teammate on the floor, next

@@ -32,6 +32,7 @@ from nbasim.wowy import player_split_games, split_summary, teammate_table
 from nbasim import hitrates
 from nbasim import picks as favs
 from nbasim import reportcard as rc
+from nbasim import linelog
 
 st.set_page_config(page_title="NBA Matchup Simulator", page_icon="🏀", layout="wide")
 
@@ -789,7 +790,7 @@ with tab_props:
         if use_live and this_game is not None and not rc.game_started(this_game):
             top = rdf.sort_values("Value Score", ascending=False).drop_duplicates(["Player", "Stat"])
             sig = hashlib.md5(pd.util.hash_pandas_object(
-                top[["Player", "Stat", "Pick", "Line", "Book", "Value Score"]], index=False).values).hexdigest()
+                rdf[["Player", "Stat", "Pick", "Line", "Book", "Value Score"]], index=False).values).hexdigest()
             if st.session_state.get(f"rc_sig_{key}") != sig:
                 try:
                     rc.record_candidates([{
@@ -801,6 +802,12 @@ with tab_props:
                         "sim_prob": round(float(r["Sim P(over)"] if r["Pick"] == "OVER" else r["Sim P(under)"])
                                           / max(float(r["Sim P(over)"]) + float(r["Sim P(under)"]), 1e-9), 3),
                         "source": "app"} for _, r in top.iterrows()])
+                    # Every book's line, for the line log's record (graded after the game).
+                    linelog.record_scored([
+                        linelog.scored_row(r, game_date, int(lookup[r["Player"]]["pid"]),
+                                           lookup[r["Player"]]["opp"], "app",
+                                           commence=str(this_game.get("start") or "") or None)
+                        for _, r in rdf.iterrows()])
                     st.session_state[f"rc_sig_{key}"] = sig
                 except Exception as exc:  # never let the report card break the Props tab
                     st.caption(f"Couldn't save these props to the report card: {exc}")
@@ -997,6 +1004,9 @@ def score_whole_slate() -> tuple[int, list[str]]:
         _, rows = run_game(ds, tr, weights, g, names, game_date, inj_report if use_injuries else None,
                            sp["raw"], min(n_sims, 3000))
         saved += rc.record_candidates([candidate_row(r, game_date, "app_slate") for r in rows])
+        linelog.record_scored([linelog.scored_row(r, game_date, r.get("Player ID"), r["Opp"], "app_slate",
+                                                  odds=r["Odds"], commence=str(g.get("start") or "") or None)
+                               for r in rows])
     bar.empty()
     return saved, notes
 
@@ -1081,6 +1091,102 @@ with tab_card:
                            "text/csv")
         st.caption(f"Stored on this computer in `{rc.CARD_PATH}` (candidates in `{rc.CAND_PATH}`). "
                    f"Box scores through {ds.logs_through or 'n/a'}; they refresh every hour.")
+
+# --------------------------------------------------------------------------- line log + backtest
+
+@st.cache_data(show_spinner=False)
+def run_backtest(n_games: int, n_sims: int, projected: bool, built_at: str, w: tuple):
+    from scripts.backtest_props import report, run as bt_run
+    season_start = pd.Timestamp(int(ds.season[:4]), 10, 1)
+    gids = list(ds.logs[ds.logs["GAME_DATE"] >= season_start].drop_duplicates("GAME_ID")
+                .sort_values("GAME_DATE")["GAME_ID"])[-n_games:]
+    df = bt_run(ds, tr, weights, gids, n_sims, real_minutes=not projected)
+    return report(df, f"Backtest, last {len(gids)} games, "
+                  + ("projected" if projected else "actual") + " minutes")
+
+
+def pct_table(df: pd.DataFrame):
+    st.dataframe(df.style.format({"Win %": "{:.1%}", "Units": "{:+.2f}", "ROI": "{:+.1%}",
+                                  "Avg edge": "{:+.1%}", "Beat close %": "{:.0%}", "Avg CLV": "{:+.1%}",
+                                  "Avg model": "{:.1%}", "Avg book": "{:.1%}", "Won": "{:.1%}"},
+                                 na_rep="—"), hide_index=True, width="stretch")
+
+
+with tab_card:
+    st.divider()
+    st.subheader("📈 Every scored line")
+    try:
+        n_graded = linelog.grade(ds.logs)
+    except Exception as exc:  # grading problems shouldn't hide the rest of the tab
+        n_graded = 0
+        st.caption(f"Couldn't grade the line log: {exc}")
+    if n_graded:
+        st.toast(f"Graded {n_graded} logged lines", icon="📈")
+    sl = linelog.load_scored()
+    st.caption("Every sportsbook line the model scored before tip-off is saved and graded after the "
+               "game, so each props pull adds to a real track record with no extra credits. Lines are "
+               "scored when you open a game on 💰 Player Props with live lines, or with **Score every "
+               "game now** above. Every pull is also saved with its prices, and the last pull before "
+               "tip-off is the closing line. **Beat close %** is how often the market moved toward "
+               "the model's side after it was scored, the best long-run sign of a real edge.")
+    if not len(sl):
+        st.info("Nothing logged yet. Pull props and score the games, and results show up here the day after.")
+    else:
+        g_all = sl[sl["result"].isin(["win", "loss", "push"])]
+        view = st.radio("Count", ["Best line per prop (the bet you'd make)", "Every book's line"],
+                        horizontal=True, key="ll_view")
+        d = linelog.best_per_prop(sl) if view.startswith("Best") else sl
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Lines scored", f"{len(sl):,}", f"{len(g_all):,} graded", delta_color="off")
+        allr = linelog.summary(d)
+        if len(allr):
+            r0 = allr.iloc[0]
+            m2.metric("Record", r0["Record"], f"{r0['Win %']:.1%} · {r0['Units']:+.1f} u", delta_color="off")
+            m3.metric("Beat the close", "—" if pd.isna(r0["Beat close %"]) else f"{r0['Beat close %']:.0%}",
+                      "of bets with a closing line", delta_color="off")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**By grade**")
+            pct_table(linelog.summary(d, "grade").rename(columns={"grade": "Grade"}))
+        with c2:
+            st.markdown("**By stat**")
+            pct_table(linelog.summary(d, "stat").rename(columns={"stat": "Stat"}))
+        c3, c4 = st.columns(2)
+        with c3:
+            st.markdown("**Over vs under**")
+            pct_table(linelog.summary(d, "side").rename(columns={"side": "Side"}))
+        with c4:
+            st.markdown("**By month**")
+            pct_table(linelog.summary(d, "month").rename(columns={"month": "Month"}))
+        st.markdown("**Calibration**: the model's probability for its side vs how often it won")
+        st.caption("If the model is well calibrated, **Won** tracks **Avg model**. If Won sits nearer "
+                   "**Avg book**, the market blend (Factor weights → Props) should go up.")
+        pct_table(linelog.calibration(d))
+        with st.expander("By book"):
+            pct_table(linelog.summary(d, "book").rename(columns={"book": "Book"}))
+        st.download_button("Download scored lines (CSV)", sl.to_csv(index=False), "scored_lines.csv", "text/csv")
+        st.caption(f"Stored on this computer in `{linelog.SCORED_PATH}` (pulled lines in `{linelog.LOG_PATH}`).")
+
+    st.divider()
+    st.subheader("🧪 Backtest (no credits)")
+    st.caption("Re-simulates games already played this season and compares the sim with the box "
+               "scores: bias per stat, and whether P(over) at each player's season-average line is "
+               "calibrated. No sportsbook lines needed. **Actual minutes** checks the per-minute "
+               "model alone; **projected minutes** includes minutes errors, like a real night. "
+               "About 2 to 5 seconds per game.")
+    bc1, bc2, bc3 = st.columns(3)
+    bt_games = bc1.select_slider("Games", [20, 40, 80, 150, 250], 40, key="bt_games")
+    bt_sims = bc2.select_slider("Sims per game", [200, 400, 800], 400, key="bt_sims")
+    bt_proj = bc3.toggle("Projected minutes", True, key="bt_proj")
+    if st.button("Run backtest", key="bt_run"):
+        with st.spinner(f"Simulating {bt_games} games..."):
+            try:
+                st.session_state.bt_report = run_backtest(bt_games, bt_sims, bt_proj, ds.built_at,
+                                                          tuple(sorted(weights.as_dict().items())))
+            except Exception as exc:
+                st.session_state.bt_report = f"Backtest failed: {exc}"
+    if "bt_report" in st.session_state:
+        st.markdown(st.session_state.bt_report)
 
 # --------------------------------------------------------------------------- player deep dive
 

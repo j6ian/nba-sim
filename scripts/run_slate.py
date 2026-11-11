@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore")
 from nbasim import data as nbadata  # noqa: E402
 from nbasim import injuries  # noqa: E402
 from nbasim import odds as oddsapi  # noqa: E402
+from nbasim import linelog  # noqa: E402
 from nbasim import reportcard  # noqa: E402
 from nbasim import schedule  # noqa: E402
 from nbasim.detail import schedule_context, schedule_factor  # noqa: E402
@@ -194,7 +195,8 @@ def run_game(ds, tr, weights, g, names, game_date, inj_report, lines, n_sims):
                          "Pick": ev["Pick"], "Line": float(r["Line"]), "Odds": float(odds),
                          "Book": r["Book"], "Value Score": ev["Value Score"], "Grade": ev["Grade"],
                          "Sim mean": ev["Sim mean"], "Sim P(over)": ev["Sim P(over)"],
-                         "Model P(over)": ev["Model P(over)"],
+                         "Model P(over)": ev["Model P(over)"], "Model P(under)": ev["Model P(under)"],
+                         "Sim P(under)": ev["Sim P(under)"],
                          "Book P(over)": ev["Book P(over)"],
                          "EV": ev["EV over"] if ev["Pick"] == "OVER" else ev["EV under"],
                          "L10 hit": ev["L10 hit"], "Proj Min": info["proj"],
@@ -415,6 +417,14 @@ def main():
         [candidate_row(r, game_date, "run_slate") for _, r in best.iterrows() if r["Game"] in not_started])
     if saved:
         log(f"Saved {saved} props as report card candidates for {game_date}.")
+    if len(allp):
+        start = {f"{g['away']} @ {g['home']}": g.get("start") for g in slate}
+        n_lines = linelog.record_scored([
+            linelog.scored_row(r, game_date, r.get("Player ID"), r["Opp"], "run_slate", odds=r["Odds"],
+                               commence=str(start.get(r["Game"]) or "") or None)
+            for _, r in allp.iterrows() if r["Game"] in not_started])
+        if n_lines:
+            log(f"Saved {n_lines} scored lines to the line log for grading.")
     meta = {"sims": args.sims, "generated": fmt(dt.datetime.now(), "%b %-d %-I:%M %p"),
             "markets": markets, "credits_used": used,
             "credits_left": (oddsapi.latest_quota() or {}).get("remaining"), "warnings": warnings_,
